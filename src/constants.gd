@@ -1,5 +1,5 @@
 
-const MODLOADER_VERSION := "1.1.0"
+const MODLOADER_VERSION := "1.2.0"
 
 const MODLOADER_RES_PATH := "res://OrcLoader.gd"
 const MOD_DIR := "mods"
@@ -50,7 +50,6 @@ var _has_loaded := false
 var _last_mod_txt_status := "none"
 var _last_mod_txt_error := ""
 var _boot_complete: bool = false
-var _dirty_since_boot: bool = false
 
 var _mods_filter_text: String = ""
 var _mods_hide_disabled: bool = false
@@ -108,3 +107,23 @@ var _rtv_re_static_func: RegEx
 var _rtv_re_var: RegEx
 
 var _filescope_mounted: Dictionary = _mount_previous_session()
+
+signal ui_finished(action: String)
+var _running_configuration := ""
+var _close_dialog: ConfirmationDialog
+var _ui_finishing := false
+var _ui_rows: Array[Dictionary] = []
+var _scan_cache: Dictionary = {}
+var _performance: Dictionary = {}
+
+var _archive_text: Dictionary = {}
+var _archive_text_bytes := 0
+var _save_error := OK
+var _snapshot_enabled := false
+var _diagnostics_enabled := false
+var _mod_settings: Dictionary = {}
+var _script_discovery_source := "not enumerated"
+
+var _archive_fingerprints: Dictionary = {}
+var _scan_progress: Label
+var _ui_back_button: Button

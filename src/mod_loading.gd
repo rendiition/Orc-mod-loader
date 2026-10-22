@@ -15,16 +15,7 @@ func load_all_mods(pass_label: String = "") -> void:
 
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(TMP_DIR))
 
-	var candidates: Array[Dictionary] = []
-	for entry in _ui_mod_entries:
-		if not entry["enabled"]:
-			continue
-		if bool(entry.get("dependency_blocked", false)):
-			_log_warning("Skipping " + str(entry.get("mod_name", entry.get("file_name", "")))
-					+ " -- required dependencies are missing or incompatible.")
-			continue
-		candidates.append(entry.duplicate())
-	candidates.sort_custom(_compare_load_order)
+	var candidates := _ordered_candidates(_ui_mod_entries)
 
 	if candidates.is_empty():
 		_log_info("No mods enabled.")
@@ -47,7 +38,19 @@ func load_all_mods(pass_label: String = "") -> void:
 	_log_info("=" .repeat(header.length()))
 
 	for load_index in candidates.size():
-		_process_mod_candidate(candidates[load_index], load_index)
+		var candidate := candidates[load_index]
+		var prerequisites_loaded := true
+		for dep in candidate.get("dependencies_required", []):
+			var found := false
+			for id in _loaded_mod_ids:
+				if str(id).to_lower() == str(dep["id"]).to_lower():
+					found = true
+			if not found:
+				prerequisites_loaded = false
+		if prerequisites_loaded:
+			_process_mod_candidate(candidate, load_index)
+		else:
+			_log_warning("Skipping %s: a prerequisite failed to load" % candidate["mod_name"])
 
 	_merge_hook_calls_into_wrap_mask()
 
@@ -317,6 +320,7 @@ func _apply_script_overrides() -> void:
 
 func scan_and_register_archive_claims(archive_path: String, mod_name: String,
 		archive_file: String, load_index: int) -> void:
+	_archive_fingerprints[archive_path] = FileAccess.get_sha256(archive_path)
 	var zr := ZIPReader.new()
 	if zr.open(archive_path) != OK:
 		_log_warning("  Could not scan archive: " + archive_file)
@@ -355,7 +359,7 @@ func scan_and_register_archive_claims(archive_path: String, mod_name: String,
 	for f in files:
 		if f.get_extension().to_lower() == "gd":
 			gd_analysis["total_gd_files"] = gd_analysis["total_gd_files"] + 1
-			var gd_bytes := zr.read_file(f)
+			var gd_bytes := _archive_bytes(zr, archive_path, f)
 			if gd_bytes.size() > 0:
 				var gd_text := gd_bytes.get_string_from_utf8()
 				_scan_gd_source(gd_text, gd_analysis)

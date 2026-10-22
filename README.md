@@ -1,6 +1,8 @@
 # OrcKit
 
-OrcKit is a mod loader for **Sir, We Have an Orc Problem Playtest**.
+OrcKit is a mod loader for **Sir, We Have an Orc Problem**.
+
+This fork's 1.2.0 changes add in-game X/ESC closing, deferred loadout changes, dependency ordering, recoverable configuration writes, embedded-pack discovery, scan caching, and optional save snapshots and mod settings. See [changes and usage](CHANGES.md) and [validation](tests/VALIDATION.md).
 
 It loads mods from the game folder, adds a native **Mods** button to the main menu, and provides a simple in-game UI for enabling mods and changing load order.
 
@@ -20,7 +22,7 @@ https://github.com/ESTONlA/modmenu
 
 ## Supported Game
 
-This loader targets:
+Originally built for the playtest, this fork has also been tested with game build `2026.08.18.12.05`. Paths are resolved from the running executable; there is no fixed playtest executable target. The original Steam layout is:
 
 ```text
 Sir, We Have an Orc Problem Playtest

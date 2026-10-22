@@ -1,2 +1,4 @@
 Wiki/
 KoopaOrcs/
+__pycache__/
+*.pyc

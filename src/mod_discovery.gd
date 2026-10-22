@@ -1,5 +1,8 @@
 
 func collect_mod_metadata() -> Array[Dictionary]:
+	var started := Time.get_ticks_usec()
+	_archive_text.clear()
+	_archive_text_bytes = 0
 	var entries: Array[Dictionary] = []
 	_mods_dir = OS.get_executable_path().get_base_dir().path_join(MOD_DIR)
 	_log_info("Scanning mods dir: " + _mods_dir)
@@ -16,6 +19,10 @@ func collect_mod_metadata() -> Array[Dictionary]:
 	dir.list_dir_begin()
 	while true:
 		var entry_name := dir.get_next()
+		if is_inside_tree():
+			if is_instance_valid(_scan_progress):
+				_scan_progress.text = "Inspecting mods: " + entry_name
+			await get_tree().process_frame
 		if entry_name == "":
 			break
 		if dir.current_is_dir():
@@ -50,6 +57,7 @@ func collect_mod_metadata() -> Array[Dictionary]:
 		for e in entries:
 			var tag := " [folder]" if e["ext"] == "folder" else ""
 			_log_info("  " + e["file_name"] + " (" + e["mod_name"] + ")" + tag)
+	_record_timing("discovery", started)
 	return entries
 
 func _build_archive_entry(mods_dir: String, file_name: String, ext: String) -> Dictionary:
@@ -57,11 +65,18 @@ func _build_archive_entry(mods_dir: String, file_name: String, ext: String) -> D
 	var full_path := mods_dir.path_join(file_name)
 	if ext == "pck":
 		_last_mod_txt_status = "pck"
-	var cfg: ConfigFile = read_mod_config(full_path) if ext != "pck" else null
+	var package_error := ""
+	if ext != "pck" and _zip_scan_sizes(full_path).is_empty():
+		package_error = "Archive invalid or exceeds supported limits (32 MiB/file, 256 MiB total, 10000 entries; no ZIP64/encryption)"
+	var cfg: ConfigFile = read_mod_config(full_path) if ext != "pck" and package_error.is_empty() else null
 	var entry := _entry_from_config(cfg, file_name, full_path, ext)
+	entry["package_error"] = package_error
 	entry["warnings"] = _build_entry_warnings(entry)
 	entry["security_findings"] = scan_mod(full_path, ext)
 	entry["risk_level"] = compute_risk_level(entry["security_findings"])
+	for finding in entry["security_findings"]:
+		if finding.get("rule") == "incomplete_scan":
+			entry["warnings"].append("Scan incomplete: " + str(finding["description"]))
 	_log_security_findings(entry)
 	return entry
 
@@ -73,6 +88,9 @@ func _build_folder_entry(mods_dir: String, dir_name: String) -> Dictionary:
 	entry["warnings"] = _build_entry_warnings(entry)
 	entry["security_findings"] = scan_mod(folder_path, "folder")
 	entry["risk_level"] = compute_risk_level(entry["security_findings"])
+	for finding in entry["security_findings"]:
+		if finding.get("rule") == "incomplete_scan":
+			entry["warnings"].append("Scan incomplete: " + str(finding["description"]))
 	_log_security_findings(entry)
 	return entry
 
@@ -223,6 +241,8 @@ func _resolve_entry_dependencies(entries: Array[Dictionary]) -> void:
 		by_id[str(entry.get("mod_id", "")).to_lower()] = entry
 	for entry: Dictionary in entries:
 		var errors: Array[String] = []
+		if not str(entry.get("package_error", "")).is_empty():
+			errors.append(entry["package_error"])
 		var warnings: Array[String] = []
 		for dep: Dictionary in entry.get("dependencies_required", []):
 			var issue := _dependency_issue(dep, by_id)
@@ -242,6 +262,8 @@ func _dependency_issue(dep: Dictionary, by_id: Dictionary) -> String:
 	var raw := str(dep.get("raw", dep_id))
 	if not by_id.has(dep_id):
 		return "Missing required dependency: " + raw
+	if not by_id[dep_id].get("enabled", false):
+		return "Required dependency disabled: " + raw
 	var op := str(dep.get("op", ""))
 	var version := str(dep.get("version", ""))
 	if op == "":
@@ -344,3 +366,34 @@ func _compare_dedup_priority(a: Dictionary, b: Dictionary) -> bool:
 	if am != bm:
 		return am > bm
 	return (a["file_name"] as String).to_lower() < (b["file_name"] as String).to_lower()
+
+func _ordered_candidates(entries: Array[Dictionary]) -> Array[Dictionary]:
+	_resolve_entry_dependencies(entries)
+	var remaining: Array[Dictionary] = []
+	for entry in entries:
+		if entry.get("enabled", false) and not entry.get("dependency_blocked", false):
+			remaining.append(entry)
+	remaining.sort_custom(_compare_load_order)
+	var ordered: Array[Dictionary] = []
+	var ready: Dictionary = {}
+	while not remaining.is_empty():
+		var advanced := false
+		for i in remaining.size():
+			var entry := remaining[i]
+			var satisfied := true
+			for dep in entry.get("dependencies_required", []):
+				if not ready.has(str(dep["id"]).to_lower()):
+					satisfied = false
+			if satisfied:
+				ordered.append(entry)
+				ready[str(entry["mod_id"]).to_lower()] = true
+				remaining.remove_at(i)
+				advanced = true
+				break
+		if not advanced:
+			for entry in remaining:
+				entry["dependency_blocked"] = true
+				entry["dependency_errors"].append("Dependency cycle or blocked prerequisite")
+				entry["warnings"] = _build_entry_warnings(entry)
+			break
+	return ordered

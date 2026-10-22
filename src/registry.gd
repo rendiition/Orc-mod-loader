@@ -49,7 +49,7 @@ func patch(registry: String, id: Variant, fields: Dictionary) -> bool:
 	if not (id is String) or String(id) == "":
 		push_warning("[Registry] patch('%s', ...): id must be a non-empty String" % registry)
 		return false
-	var current := get_entry(registry, id)
+	var current: Variant = get_entry(registry, id)
 	if current == null:
 		_registry_warn_unsupported("patch", registry)
 		return false
@@ -86,7 +86,7 @@ func _array_op(registry: String, id: Variant, field: String, values: Variant, op
 	if not (id is String):
 		push_warning("[Registry] %s('%s', ...): id must be a String" % [op, registry])
 		return false
-	var current := get_entry(registry, String(id))
+	var current: Variant = get_entry(registry, String(id))
 	if current == null or not (current is Object):
 		_registry_warn_unsupported(op, registry)
 		return false
@@ -102,7 +102,7 @@ func _array_op(registry: String, id: Variant, field: String, values: Variant, op
 	var stash: Dictionary = reg_patch[id]
 	if not stash.has(field):
 		stash[field] = (existing as Array).duplicate()
-	var incoming := values if values is Array else [values]
+	var incoming: Array = values if values is Array else [values]
 	match op:
 		"append":
 			for value in incoming:
@@ -142,7 +142,7 @@ func revert(registry: String, id: Variant, fields: Array = []) -> bool:
 		(_registry_overridden[registry] as Dictionary).erase(sid)
 		changed = true
 	if _registry_patched.has(registry) and (_registry_patched[registry] as Dictionary).has(sid):
-		var current := get_entry(registry, sid)
+		var current: Variant = get_entry(registry, sid)
 		if current is Object:
 			var stash: Dictionary = (_registry_patched[registry] as Dictionary)[sid]
 			var names := fields if not fields.is_empty() else stash.keys()

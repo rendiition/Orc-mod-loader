@@ -19,6 +19,11 @@ func _register_orcmodlib_meta() -> void:
 	_log_info("[OrcmodLib] modloader registered as Engine.meta('OrcmodLib')")
 
 func _emit_frameworks_ready() -> void:
+	_running_configuration = _configuration_signature()
+	var applied := ConfigFile.new()
+	applied.load(UI_CONFIG_PATH)
+	applied.set_value("settings", "last_applied_loadout", _running_configuration)
+	_save_preferences(applied)
 	_is_ready = true
 	_register_core_hooks()
 	_scene_nodes_connect_listener()
@@ -48,8 +53,10 @@ func hook(hook_name: String, callback: Callable, priority: int = 100) -> int:
 	if not _hooks.has(hook_name):
 		_hooks[hook_name] = []
 	var entry := { "callback": callback, "priority": priority, "id": _next_id }
-	(_hooks[hook_name] as Array).append(entry)
-	(_hooks[hook_name] as Array).sort_custom(func(a, b): return a["priority"] < b["priority"])
+	var updated: Array = _hooks[hook_name].duplicate()
+	updated.append(entry)
+	updated.sort_custom(func(a, b): return a["priority"] < b["priority"] if a["priority"] != b["priority"] else a["id"] < b["id"])
+	_hooks[hook_name] = updated
 	_any_mod_hooked = true
 	var base := _hook_base_of(hook_name)
 	_hooked_bases[base] = int(_hooked_bases.get(base, 0)) + 1
@@ -80,10 +87,11 @@ func hook_many(entries: Dictionary, priority: int = 100) -> Dictionary:
 
 func unhook(hook_id: int) -> void:
 	for hook_name in _hooks:
-		var arr: Array = _hooks[hook_name]
+		var arr: Array = _hooks[hook_name].duplicate()
 		for i in range(arr.size() - 1, -1, -1):
 			if arr[i]["id"] == hook_id:
 				arr.remove_at(i)
+				_hooks[hook_name] = arr
 				var base := _hook_base_of(hook_name)
 				var c: int = int(_hooked_bases.get(base, 0)) - 1
 				if c <= 0:
@@ -261,22 +269,29 @@ func _to_version_int(s: String) -> int:
 
 
 func _dispatch(hook_name: String, args: Array) -> void:
+	var started := Time.get_ticks_usec() if _diagnostics_enabled else 0
 	if not _hooks.has(hook_name):
 		return
-	var entries: Array = (_hooks[hook_name] as Array).duplicate()
+	var entries: Array = _hooks[hook_name]
 	for entry in entries:
 		_seq += 1
 		var cb: Callable = entry["callback"]
+		if not cb.is_valid():
+			continue
 		cb.callv(args)
+	if _diagnostics_enabled:
+		_record_timing("hook:" + hook_name, started)
 
 func _dispatch_post(hook_name: String, args: Array, current_result: Variant) -> Variant:
 	if not _hooks.has(hook_name):
 		return current_result
-	var entries: Array = (_hooks[hook_name] as Array).duplicate()
+	var entries: Array = _hooks[hook_name]
 	var expected_with_result: int = args.size() + 1
 	for entry in entries:
 		_seq += 1
 		var cb: Callable = entry["callback"]
+		if not cb.is_valid():
+			continue
 		var argc: int = cb.get_argument_count()
 		var ret: Variant = null
 		if argc == expected_with_result:
@@ -295,10 +310,12 @@ func _dispatch_post(hook_name: String, args: Array, current_result: Variant) -> 
 func _dispatch_deferred(hook_name: String, args: Array) -> void:
 	if not _hooks.has(hook_name):
 		return
-	var entries: Array = (_hooks[hook_name] as Array).duplicate()
+	var entries: Array = _hooks[hook_name]
 	for entry in entries:
 		_seq += 1
 		var cb: Callable = entry["callback"]
+		if not cb.is_valid():
+			continue
 		cb.bindv(args).call_deferred()
 
 func _get_hooks(hook_name: String) -> Array:
@@ -308,3 +325,15 @@ func _get_hooks(hook_name: String) -> Array:
 	for entry in _hooks[hook_name]:
 		callbacks.append(entry["callback"])
 	return callbacks
+
+# Settings are opt-in and apply live through the mod's callback; no loader restart.
+func register_mod_setting(mod_id: String, key: String, label: String, choices: Array, default_value: Variant, callback: Callable) -> bool:
+	if mod_id.is_empty() or key.is_empty() or choices.is_empty() or not default_value in choices or not callback.is_valid():
+		return false
+	_mod_settings[mod_id + "/" + key] = {"mod_id": mod_id, "key": key, "label": label, "choices": choices.duplicate(), "default": default_value, "callback": callback}
+	return true
+
+func get_mod_setting(mod_id: String, key: String, default_value: Variant = null) -> Variant:
+	var cfg := ConfigFile.new()
+	cfg.load(UI_CONFIG_PATH)
+	return cfg.get_value("mod_settings." + mod_id, key, default_value)

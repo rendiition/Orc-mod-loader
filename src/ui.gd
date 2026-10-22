@@ -4,6 +4,8 @@ func _load_developer_mode_setting() -> void:
 	if cfg.load(UI_CONFIG_PATH) != OK:
 		return
 	_developer_mode = bool(cfg.get_value("settings", "developer_mode", false))
+	_snapshot_enabled = bool(cfg.get_value("settings", "save_snapshots", false))
+	_diagnostics_enabled = bool(cfg.get_value("settings", "diagnostics", false))
 	if _developer_mode:
 		_log_info("Developer mode: ON")
 
@@ -27,7 +29,7 @@ func _load_ui_config() -> void:
 			for key: String in cfg.get_section_keys("priority"):
 				cfg.set_value("profile.Default.priority", key, cfg.get_value("priority", key))
 
-	_active_profile = "Default"
+	_active_profile = str(cfg.get_value("settings", "active_profile", "Default"))
 
 	_apply_profile_to_entries(cfg, _active_profile)
 
@@ -75,9 +77,8 @@ func _save_per_profile_setting(key: String, value: Variant) -> void:
 	cfg.load(UI_CONFIG_PATH)
 	var sec := "profile." + _active_profile + ".settings"
 	cfg.set_value(sec, key, value)
-	cfg.save(UI_CONFIG_PATH)
-	if _boot_complete:
-		_dirty_since_boot = true
+	_save_preferences(cfg)
+	refresh_launch_button_label()
 
 func _mods_entry_visible(entry: Dictionary) -> bool:
 	if _mods_hide_disabled and not bool(entry.get("enabled", false)):
@@ -166,9 +167,10 @@ func _save_ui_config() -> void:
 
 	cfg.set_value("settings", "developer_mode", _developer_mode)
 	cfg.set_value("settings", "active_profile", _active_profile)
-	cfg.save(UI_CONFIG_PATH)
-	if _boot_complete:
-		_dirty_since_boot = true
+	cfg.set_value("settings", "save_snapshots", _snapshot_enabled)
+	cfg.set_value("settings", "diagnostics", _diagnostics_enabled)
+	_save_preferences(cfg)
+	refresh_launch_button_label()
 
 func _missing_mods_in_active_profile() -> Array[String]:
 	var cfg := ConfigFile.new()
@@ -206,7 +208,7 @@ func _remove_missing_entry_from_profile(stored_key: String) -> void:
 		var sec := "profile." + _active_profile + suffix
 		if cfg.has_section(sec) and cfg.has_section_key(sec, stored_key):
 			cfg.erase_section_key(sec, stored_key)
-	cfg.save(UI_CONFIG_PATH)
+	_save_preferences(cfg)
 
 func _remove_all_missing_entries_from_profile() -> void:
 	var missing := _missing_mods_in_active_profile()
@@ -222,7 +224,7 @@ func _remove_all_missing_entries_from_profile() -> void:
 		for key: String in missing:
 			if cfg.has_section_key(sec, key):
 				cfg.erase_section_key(sec, key)
-	cfg.save(UI_CONFIG_PATH)
+	_save_preferences(cfg)
 
 func _rebuild_mods_tab(tabs: TabContainer) -> void:
 	var old := tabs.get_node_or_null("Mods")
@@ -412,7 +414,9 @@ func _ui_button_style(btn: Button, bg: Color, border: Color, hover: Color, press
 	btn.add_theme_color_override("font_color", Color(0.89, 0.93, 0.82))
 	btn.add_theme_color_override("font_hover_color", Color(1.0, 1.0, 1.0))
 
-func show_mod_ui() -> void:
+func show_mod_ui() -> String:
+	_ui_finishing = false
+	var previous_focus := get_viewport().gui_get_focus_owner()
 	var layer := CanvasLayer.new()
 	layer.name = "OrcKitUILayer"
 	layer.layer = 8192
@@ -495,7 +499,7 @@ func show_mod_ui() -> void:
 	title_stack.add_child(title)
 
 	var subtitle := Label.new()
-	subtitle.text = "Mod loadout manager for Sir, We Have an Orc Problem Playtest"
+	subtitle.text = "Mod loadout manager for Sir, We Have an Orc Problem"
 	subtitle.add_theme_font_size_override("font_size", 12)
 	subtitle.modulate = Color(0.64, 0.70, 0.58)
 	title_stack.add_child(subtitle)
@@ -519,6 +523,12 @@ func show_mod_ui() -> void:
 	var version_box := PanelContainer.new()
 	version_box.add_theme_stylebox_override("panel", _ui_box(Color(0.034, 0.042, 0.036), Color(0.17, 0.23, 0.15), 10, 7))
 	header.add_child(version_box)
+	if _boot_complete:
+		var close_button := Button.new()
+		close_button.text = "×"
+		close_button.tooltip_text = "Close (Esc)"
+		close_button.pressed.connect(_request_ui_close)
+		header.add_child(close_button)
 	var version_lbl := Label.new()
 	version_lbl.text = "OrcKit " + MODLOADER_VERSION
 	version_lbl.add_theme_font_size_override("font_size", 11)
@@ -536,7 +546,7 @@ func show_mod_ui() -> void:
 		warn_box.add_child(warn_lbl)
 
 	var tabs := TabContainer.new()
-	tabs.tabs_visible = false
+	tabs.tabs_visible = true
 	tabs.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	root.add_child(tabs)
 
@@ -558,30 +568,43 @@ func show_mod_ui() -> void:
 	launch_btn.custom_minimum_size = Vector2(230, 44)
 	_ui_button_style(launch_btn, Color(0.20, 0.31, 0.13), Color(0.58, 0.74, 0.35), Color(0.28, 0.42, 0.18), Color(0.13, 0.20, 0.09))
 
+	if _boot_complete:
+		var back := Button.new()
+		_ui_back_button = back
+		back.text = "Back to Game"
+		back.pressed.connect(_request_ui_close)
+		bottom.add_child(back)
 	bottom.add_child(launch_btn)
 	_ui_launch_btn = launch_btn
 
 	var mods_tab := build_mods_tab(tabs)
 	mods_tab.name = "Mods"
 	tabs.add_child(mods_tab)
+	tabs.add_child(_build_settings_tab())
 
 	refresh_launch_button_label()
 
-	while true:
-		await launch_btn.pressed
-		var red_mods := _enabled_red_mods()
-		if red_mods.is_empty():
-			break
-		var proceed: bool = await _confirm_red_launch(red_mods)
-		if proceed:
-			break
+	launch_btn.pressed.connect(_request_ui_launch)
+	var action: String = await ui_finished
 	_ui_window = null
+	_ui_back_button = null
 	_ui_hint_label = null
 	_ui_launch_btn = null
 	layer.queue_free()
+	if is_instance_valid(previous_focus):
+		previous_focus.grab_focus()
+	return action
 
 func refresh_launch_button_label() -> void:
 	if not is_instance_valid(_ui_launch_btn):
+		return
+	if _boot_complete:
+		var pending := _has_pending_changes()
+		if is_instance_valid(_ui_back_button):
+			_ui_back_button.visible = pending
+		_ui_launch_btn.text = "Apply and Restart" if pending else "Back to Game"
+		if is_instance_valid(_ui_hint_label):
+			_ui_hint_label.text = "Restart required — saved changes apply next launch." if pending else "Current mods are running. No restart required."
 		return
 	var any_enabled := false
 	for entry in _ui_mod_entries:
@@ -1022,7 +1045,7 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 		for child in order_list.get_children():
 			child.queue_free()
 		var sorted := _ui_mod_entries.filter(func(e): return e["enabled"])
-		sorted.sort_custom(_compare_load_order)
+		sorted = _ordered_candidates(_ui_mod_entries)
 		if sorted.is_empty():
 			var lbl := Label.new()
 			lbl.text = "No armed mods yet."
@@ -1055,15 +1078,15 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 
 	dev_check.toggled.connect(func(on: bool):
 		_developer_mode = on
-		_ui_mod_entries = collect_mod_metadata()
+		_save_ui_config()
+		_ui_mod_entries = await _discover_with_progress()
 		_load_ui_config()
 		_rebuild_mods_tab(tabs)
 	)
 
 	filter_edit.text_changed.connect(func(t: String):
 		_mods_filter_text = t
-		_mods_filter_focus_pending = true
-		_rebuild_mods_tab(tabs)
+		_filter_mod_rows()
 	)
 	all_btn.pressed.connect(func():
 		for entry in _ui_mod_entries:
@@ -1082,7 +1105,7 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 	hide_check.toggled.connect(func(on: bool):
 		_mods_hide_disabled = on
 		_save_per_profile_setting("hide_disabled", on)
-		_rebuild_mods_tab(tabs)
+		_filter_mod_rows()
 	)
 
 	var missing_files := _missing_mods_in_active_profile()
@@ -1147,10 +1170,9 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 		empty.add_theme_font_size_override("font_size", 13)
 		empty_panel.add_child(empty)
 
+	_ui_rows.clear()
 	var rendered_any := false
 	for entry in _ui_mod_entries:
-		if not _mods_entry_visible(entry):
-			continue
 		rendered_any = true
 		var row_panel := PanelContainer.new()
 		row_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -1158,6 +1180,8 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 		var row_border := Color(0.25, 0.38, 0.16) if entry["enabled"] else Color(0.11, 0.15, 0.10)
 		row_panel.add_theme_stylebox_override("panel", _ui_box(row_bg, row_border, 0, 8))
 		list.add_child(row_panel)
+		row_panel.visible = _mods_entry_visible(entry)
+		_ui_rows.append({"control": row_panel, "entry": entry})
 
 		var row_pad := MarginContainer.new()
 		row_pad.add_theme_constant_override("margin_left", 10)
@@ -1284,6 +1308,7 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 			refresh_order.call()
 			refresh_summary.call()
 			_save_ui_config()
+			_filter_mod_rows()
 		)
 		spin.value_changed.connect(func(val: float):
 			e["priority"] = int(val)
@@ -1308,3 +1333,159 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 	refresh_order.call()
 	refresh_summary.call()
 	return outer
+
+# Compare effective loadouts, not whether a save callback happened.
+func _configuration_signature() -> String:
+	var selected: Array[Dictionary] = []
+	for entry in _ui_mod_entries:
+		if entry.get("enabled", false):
+			selected.append(entry)
+	selected.sort_custom(_compare_load_order)
+	var parts := PackedStringArray()
+	for entry in selected:
+		parts.append("%s|%s|%s" % [entry["mod_id"], entry["version"], entry["full_path"]])
+	return "\n".join(parts).sha256_text()
+
+func _has_pending_changes() -> bool:
+	return _boot_complete and _configuration_signature() != _running_configuration
+
+func _input(event: InputEvent) -> void:
+	if not is_instance_valid(_ui_window) or not event.is_action_pressed("ui_cancel") or event.is_echo():
+		return
+	# Child dialogs own Escape; never dismiss two layers with one keypress.
+	for child in _ui_window.get_children():
+		if child is Window and child.visible:
+			return
+	get_viewport().set_input_as_handled()
+	_request_ui_close()
+
+func _request_ui_close() -> void:
+	if not _boot_complete or _ui_finishing or is_instance_valid(_close_dialog):
+		return
+	if not _has_pending_changes():
+		_finish_ui("close")
+		return
+	_close_dialog = ConfirmationDialog.new()
+	_close_dialog.title = "Restart required"
+	_close_dialog.dialog_text = "Mod changes require a restart.\nYour current session will continue using the previously loaded mods."
+	_close_dialog.ok_button_text = "Restart now"
+	_close_dialog.cancel_button_text = "Keep editing"
+	_close_dialog.add_button("Save for next launch", false, "later")
+	_attach_ui_dialog(_close_dialog)
+	_close_dialog.confirmed.connect(func(): _close_dialog.queue_free(); _request_ui_launch())
+	_close_dialog.canceled.connect(func(): _close_dialog.queue_free())
+	_close_dialog.close_requested.connect(func(): _close_dialog.queue_free())
+	_close_dialog.custom_action.connect(func(action: String):
+		if action == "later":
+			_close_dialog.queue_free()
+			_finish_ui("close")
+	)
+	_close_dialog.popup_centered()
+	_close_dialog.get_cancel_button().grab_focus()
+
+func _finish_ui(action: String) -> void:
+	if _ui_finishing:
+		return
+	_save_ui_config()
+	if _save_error != OK:
+		_show_save_error()
+		return
+	if action in ["launch", "restart"] and not _snapshot_before_launch():
+		var dialog := AcceptDialog.new()
+		dialog.dialog_text = "Save backup failed. Launch cancelled; existing saves were not changed."
+		_attach_ui_dialog(dialog)
+		dialog.confirmed.connect(dialog.queue_free)
+		dialog.close_requested.connect(dialog.queue_free)
+		dialog.popup_centered()
+		return
+	_ui_finishing = true
+	ui_finished.emit(action)
+
+func _request_ui_launch() -> void:
+	if _boot_complete and not _has_pending_changes():
+		_finish_ui("close")
+		return
+	var red_mods := _enabled_red_mods()
+	if not red_mods.is_empty() and not await _confirm_red_launch(red_mods):
+		return
+	_finish_ui("restart" if _boot_complete and _has_pending_changes() else "launch")
+
+func _filter_mod_rows() -> void:
+	for row in _ui_rows:
+		if is_instance_valid(row["control"]):
+			row["control"].visible = _mods_entry_visible(row["entry"])
+
+func _save_preferences(cfg: ConfigFile) -> Error:
+	_save_error = _save_config_recoverably(cfg, UI_CONFIG_PATH)
+	if _save_error != OK:
+		_log_critical("Could not save mod preferences: %d" % _save_error)
+	return _save_error
+
+func _show_save_error() -> void:
+	var dialog := AcceptDialog.new()
+	dialog.dialog_text = "Could not save mod settings. Check available disk space and folder permissions."
+	_attach_ui_dialog(dialog)
+	dialog.confirmed.connect(dialog.queue_free)
+	dialog.close_requested.connect(dialog.queue_free)
+	dialog.popup_centered()
+
+func _build_settings_tab() -> Control:
+	var box := VBoxContainer.new()
+	box.name = "Settings"
+	box.add_theme_constant_override("separation", 12)
+	var info := Label.new()
+	info.text = "Game: %s\nEngine: %s\nExecutable: %s\nMods: %s\nScript discovery: %s" % [ProjectSettings.get_setting("application/config/version", "unknown"), Engine.get_version_info()["string"], OS.get_executable_path(), _mods_dir, _script_discovery_source]
+	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	box.add_child(info)
+	var snapshot := CheckBox.new()
+	snapshot.text = "Back up saves before launching a changed mod loadout"
+	snapshot.button_pressed = _snapshot_enabled
+	snapshot.toggled.connect(func(on: bool): _snapshot_enabled = on; _save_ui_config())
+	box.add_child(snapshot)
+	var diagnostics := CheckBox.new()
+	diagnostics.text = "Record loader performance diagnostics"
+	diagnostics.button_pressed = _diagnostics_enabled
+	diagnostics.toggled.connect(func(on: bool): _diagnostics_enabled = on; _save_ui_config())
+	box.add_child(diagnostics)
+	if _diagnostics_enabled:
+		var timings := Label.new()
+		timings.text = "Accumulated timings (microseconds): " + JSON.stringify(_performance)
+		timings.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		box.add_child(timings)
+	for key in _mod_settings:
+		var setting: Dictionary = _mod_settings[key]
+		var row := HBoxContainer.new()
+		var label := Label.new()
+		label.text = setting["label"]
+		row.add_child(label)
+		var select := OptionButton.new()
+		var choices: Array = setting["choices"]
+		var current: Variant = get_mod_setting(setting["mod_id"], setting["key"], setting["default"])
+		for i in choices.size():
+			select.add_item(str(choices[i]))
+			if choices[i] == current:
+				select.select(i)
+		select.item_selected.connect(func(index: int):
+			var cfg := ConfigFile.new()
+			cfg.load(UI_CONFIG_PATH)
+			cfg.set_value("mod_settings." + setting["mod_id"], setting["key"], choices[index])
+			if _save_preferences(cfg) == OK and setting["callback"].is_valid():
+				setting["callback"].call(choices[index])
+		)
+		row.add_child(select)
+		box.add_child(row)
+	return box
+
+func _discover_with_progress() -> Array[Dictionary]:
+	var layer := CanvasLayer.new()
+	layer.layer = 8193
+	layer.process_mode = Node.PROCESS_MODE_ALWAYS
+	get_tree().root.add_child(layer)
+	_scan_progress = Label.new()
+	_scan_progress.text = "Inspecting mods…"
+	_scan_progress.position = Vector2(24, 24)
+	layer.add_child(_scan_progress)
+	var entries := await collect_mod_metadata()
+	_scan_progress = null
+	layer.queue_free()
+	return entries
