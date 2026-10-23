@@ -127,3 +127,5 @@ var _script_discovery_source := "not enumerated"
 var _archive_fingerprints: Dictionary = {}
 var _scan_progress: Label
 var _ui_back_button: Button
+
+var _automatic_startup := true

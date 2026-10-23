@@ -2,7 +2,7 @@
 
 A mod loader for **Sir, We Have an Orc Problem**. OrcKit adds a **Mods** button to the game's main menu and lets you enable mods, manage load order, and configure participating mods in-game.
 
-This fork builds on [Estonia's OrcKit](https://github.com/ESTONlA/Orc-mod-loader). The **1.2.0 changes are under review in [PR #1](https://github.com/rendiition/Orc-mod-loader/pull/1)**. Use the `improve-loader-workflow` branch to try them before they are merged.
+This fork builds on [Estonia's OrcKit](https://github.com/ESTONlA/Orc-mod-loader). See the [full changelog](CHANGES.md) for the fork's improvements.
 
 [Installation](#installation) · [Using the menu](#using-the-menu) · [Save backups](#optional-save-backups) · [Development](#development) · [Full changelog](CHANGES.md)
 
@@ -10,6 +10,7 @@ This fork builds on [Estonia's OrcKit](https://github.com/ESTONlA/Orc-mod-loader
 
 | Improvement | What it does |
 |---|---|
+| **Automatic startup** | After a successful setup, unchanged enabled mod packages load directly on future launches without the startup menu or another restart. |
 | **Close without restarting** | Dismiss the in-game Mods window with **X**, **Esc**, or **Back to Game**. |
 | **Clear restart choices** | Changed loadouts offer **Restart now**, **Save for next launch**, or **Keep editing**. Pending changes remain visible when you reopen the menu. |
 | **Dependency-aware loading** | Required mods must be enabled and compatible. Prerequisites load first; cycles and blocked dependencies prevent affected mods from loading. |
@@ -56,7 +57,9 @@ While the game is running, **X**, **Esc**, or **Back to Game** closes an unchang
 
 Changes are saved as you edit. Reopening the menu retains the restart reminder; reverting to the running loadout clears it. Search and display preferences do not require a restart. Closing the loader preserves the game's pause state.
 
-The **initial startup window** still requires a launch choice. Closing the in-game menu does not unload running mods.
+The **first setup** still requires a launch choice and may restart once to prepare mods. Future launches automatically resume a verified, unchanged loadout. Changed packages or load order, game/loader updates, editable folder mods, or an invalid cache return to setup and may require another restart. Closing the in-game menu does not unload running mods.
+
+Automatic startup is enabled by default. Turn off **Load saved mods automatically on startup** in Settings to show the manager each time. To request the manager for one launch, use `swhaop.exe -- --modloader-menu` (Steam launch options: `-- --modloader-menu`). You can always open **Mods** from the in-game menu.
 
 ### Load order and dependencies
 
@@ -79,7 +82,9 @@ OrcKit originated as a playtest loader. This fork has been tested on Windows wit
 | Test environment | Result |
 |---|---|
 | Game build `2026.08.18.12.05`, native Godot `4.6.3-rc2` | **13 isolated in-game checks passed**, plus the two-pass restart flow. |
-| Standalone Godot `4.7.2` | **41 regression checks passed**. |
+| Standalone Godot `4.7.2` | **52 regression checks passed**, including automatic-start validation and fallbacks. |
+
+Additional native startup scenarios verify first setup, an unchanged launch, forced menu access, interrupted-start recovery, and changed enabled mods. See the [startup results](tests/VALIDATION.md#automatic-startup-validation).
 
 Native tests used an isolated executable, disabled Steam integration, and redirected save storage. The test save's hash remained unchanged. Testing does not establish compatibility with every game build or third-party mod, and performance gains have not been benchmarked. See the [validation report](tests/VALIDATION.md), including native shutdown warnings and untested scenarios.
 

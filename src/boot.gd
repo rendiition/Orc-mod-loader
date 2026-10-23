@@ -60,6 +60,10 @@ static func _mount_previous_session() -> Dictionary:
 		_write_filescope_log(log_lines)
 		return mounted
 
+	if FileAccess.file_exists(OS.get_executable_path().get_base_dir().path_join(SAFE_MODE_FILE)):
+		_static_force_vanilla_state("safe mode requested", log_lines)
+		_write_filescope_log(log_lines)
+		return mounted
 	if FileAccess.file_exists(PASS2_DIRTY_PATH):
 		_static_force_vanilla_state("pass 2 crashed mid-run", log_lines)
 		_write_filescope_log(log_lines)
@@ -107,6 +111,13 @@ static func _mount_previous_session() -> Dictionary:
 			_write_filescope_log(log_lines)
 			return mounted
 	var paths: PackedStringArray = cfg.get_value("state", "archive_paths", PackedStringArray())
+	var saved_hook_path := str(cfg.get_value("state", "hook_pack_path", ""))
+	var saved_hook_hash := str(cfg.get_value("state", "hook_pack_hash", ""))
+	if not saved_hook_path.is_empty() and not saved_hook_hash.is_empty():
+		if not FileAccess.file_exists(saved_hook_path) or FileAccess.get_sha256(saved_hook_path) != saved_hook_hash:
+			_static_force_vanilla_state("cached hook pack changed or missing", log_lines)
+			_write_filescope_log(log_lines)
+			return mounted
 	if paths.is_empty():
 		log_lines.append("[FileScope] Pass state has no archive paths -- skipping")
 		_write_filescope_log(log_lines)
@@ -216,6 +227,7 @@ static func _mount_previous_session() -> Dictionary:
 							% [preloaded, preload_failed, skipped_lenient])
 			else:
 				log_lines.append("[FileScope] HOOK PACK mount FAILED: " + hook_pack)
+				mounted.clear() # Do not permit automatic startup after a failed mount.
 		else:
 			log_lines.append("[FileScope] HOOK PACK path in pass_state but file missing: " + hook_abs)
 
@@ -415,6 +427,7 @@ func _persist_hook_pack_state(pack_path: String, wrapped_paths: PackedStringArra
 	var cfg := ConfigFile.new()
 	cfg.load(PASS_STATE_PATH)
 	cfg.set_value("state", "hook_pack_path", pack_path)
+	cfg.set_value("state", "hook_pack_hash", FileAccess.get_sha256(pack_path))
 	cfg.set_value("state", "hook_pack_wrapped_paths", wrapped_paths)
 	cfg.set_value("state", "hook_pack_exe_mtime", FileAccess.get_modified_time(OS.get_executable_path()))
 	if cfg.get_value("state", "modloader_version", "") == "":
@@ -429,6 +442,8 @@ func _write_pass_state(archive_paths: PackedStringArray, state_hash: String = ""
 	var count: int = cfg.get_value("state", "restart_count", 0)
 	cfg.set_value("state", "restart_count", count + 1)
 	cfg.set_value("state", "mods_hash", state_hash)
+	cfg.set_value("state", "startup_ready", false)
+	cfg.set_value("state", "loadout_signature", _configuration_signature())
 	cfg.set_value("state", "archive_paths", archive_paths)
 	var archive_hashes := {}
 	for archive in archive_paths:

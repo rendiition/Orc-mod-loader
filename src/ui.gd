@@ -6,6 +6,7 @@ func _load_developer_mode_setting() -> void:
 	_developer_mode = bool(cfg.get_value("settings", "developer_mode", false))
 	_snapshot_enabled = bool(cfg.get_value("settings", "save_snapshots", false))
 	_diagnostics_enabled = bool(cfg.get_value("settings", "diagnostics", false))
+	_automatic_startup = bool(cfg.get_value("settings", "automatic_startup", true))
 	if _developer_mode:
 		_log_info("Developer mode: ON")
 
@@ -169,6 +170,7 @@ func _save_ui_config() -> void:
 	cfg.set_value("settings", "active_profile", _active_profile)
 	cfg.set_value("settings", "save_snapshots", _snapshot_enabled)
 	cfg.set_value("settings", "diagnostics", _diagnostics_enabled)
+	cfg.set_value("settings", "automatic_startup", _automatic_startup)
 	_save_preferences(cfg)
 	refresh_launch_button_label()
 
@@ -1437,6 +1439,11 @@ func _build_settings_tab() -> Control:
 	info.text = "Game: %s\nEngine: %s\nExecutable: %s\nMods: %s\nScript discovery: %s" % [ProjectSettings.get_setting("application/config/version", "unknown"), Engine.get_version_info()["string"], OS.get_executable_path(), _mods_dir, _script_discovery_source]
 	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	box.add_child(info)
+	var auto_start := CheckBox.new()
+	auto_start.text = "Load saved mods automatically on startup"
+	auto_start.button_pressed = _automatic_startup
+	auto_start.toggled.connect(func(on: bool): _automatic_startup = on; _save_ui_config())
+	box.add_child(auto_start)
 	var snapshot := CheckBox.new()
 	snapshot.text = "Back up saves before launching a changed mod loadout"
 	snapshot.button_pressed = _snapshot_enabled
