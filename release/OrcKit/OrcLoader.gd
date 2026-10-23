@@ -2,7 +2,7 @@
 extends Node
 
 
-const MODLOADER_VERSION := "1.1.0"
+const MODLOADER_VERSION := "1.2.0"
 
 const MODLOADER_RES_PATH := "res://OrcLoader.gd"
 const MOD_DIR := "mods"
@@ -53,7 +53,6 @@ var _has_loaded := false
 var _last_mod_txt_status := "none"
 var _last_mod_txt_error := ""
 var _boot_complete: bool = false
-var _dirty_since_boot: bool = false
 
 var _mods_filter_text: String = ""
 var _mods_hide_disabled: bool = false
@@ -112,6 +111,26 @@ var _rtv_re_var: RegEx
 
 var _filescope_mounted: Dictionary = _mount_previous_session()
 
+signal ui_finished(action: String)
+var _running_configuration := ""
+var _close_dialog: ConfirmationDialog
+var _ui_finishing := false
+var _ui_rows: Array[Dictionary] = []
+var _scan_cache: Dictionary = {}
+var _performance: Dictionary = {}
+
+var _archive_text: Dictionary = {}
+var _archive_text_bytes := 0
+var _save_error := OK
+var _snapshot_enabled := false
+var _diagnostics_enabled := false
+var _mod_settings: Dictionary = {}
+var _script_discovery_source := "not enumerated"
+
+var _archive_fingerprints: Dictionary = {}
+var _scan_progress: Label
+var _ui_back_button: Button
+
 
 func _log_info(msg: String) -> void:
 	var line := "[OrcKit][Info] " + msg
@@ -134,6 +153,14 @@ func _log_debug(msg: String) -> void:
 	var line := "[OrcKit][Debug] " + msg
 	print(line)
 	_report_lines.append(line)
+func _record_timing(phase: String, started: int) -> void:
+	if not _diagnostics_enabled:
+		return
+	var elapsed := Time.get_ticks_usec() - started
+	_performance[phase] = int(_performance.get(phase, 0)) + elapsed
+	if phase.begins_with("hook:"):
+		return
+	_log_info("[Performance] %s: %.2f ms (total %.2f ms)" % [phase, elapsed / 1000.0, _performance[phase] / 1000.0])
 
 
 static func _static_vmz_to_zip(vmz_path: String) -> String:
@@ -416,6 +443,127 @@ func _zip_folder_recursive(zp: ZIPPacker, disk_path: String, archive_prefix: Str
 			zp.write_file(data)
 			zp.close_file()
 	dir.list_dir_end()
+static func _replace_file_recoverably(path: String, tmp: String) -> Error:
+	var backup := path + ".bak"
+	var had_original := FileAccess.file_exists(path)
+	if had_original:
+		if FileAccess.file_exists(backup):
+			var remove_error := DirAccess.remove_absolute(backup)
+			if remove_error != OK:
+				return remove_error
+		var backup_error := DirAccess.copy_absolute(path, backup)
+		if backup_error != OK:
+			return backup_error
+		if FileAccess.get_sha256(path) != FileAccess.get_sha256(backup):
+			return ERR_FILE_CORRUPT
+	var err := DirAccess.rename_absolute(tmp, path)
+	if err != OK and had_original and not FileAccess.file_exists(path):
+		DirAccess.copy_absolute(backup, path)
+	return err
+
+static func _save_config_recoverably(cfg: ConfigFile, path: String) -> Error:
+	var tmp := path + ".tmp"
+	var err := cfg.save(tmp)
+	if err != OK:
+		return err
+	var verify := ConfigFile.new()
+	if verify.load(tmp) != OK:
+		return ERR_FILE_CORRUPT
+	return _replace_file_recoverably(ProjectSettings.globalize_path(path), ProjectSettings.globalize_path(tmp))
+
+# Inspect ZIP central-directory sizes before ZIPReader allocates decompressed entries.
+# ZIP64/encrypted archives are explicitly unsupported by this bounded scanner.
+func _zip_scan_sizes(path: String) -> Dictionary:
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null or file.get_length() < 22:
+		return {}
+	var tail_size: int = mini(file.get_length(), 65557)
+	file.seek(file.get_length() - tail_size)
+	var tail := file.get_buffer(tail_size)
+	var end := -1
+	for i in range(tail.size() - 22, -1, -1):
+		if tail.decode_u32(i) == 0x06054b50 and i + 22 + tail.decode_u16(i + 20) == tail.size():
+			end = i
+			break
+	if end < 0 or tail.decode_u16(end + 4) != 0 or tail.decode_u16(end + 6) != 0:
+		return {}
+	var count := tail.decode_u16(end + 10)
+	var offset := tail.decode_u32(end + 16)
+	if count == 65535 or count > 10000 or offset >= file.get_length():
+		return {}
+	file.seek(offset)
+	var sizes := {}
+	var total := 0
+	for i in count:
+		var header := file.get_buffer(46)
+		if header.size() != 46 or header.decode_u32(0) != 0x02014b50 or header.decode_u16(8) & 1:
+			return {}
+		var size := header.decode_u32(24)
+		total += size
+		if size > 32 * 1024 * 1024 or total > 256 * 1024 * 1024:
+			return {}
+		var name := file.get_buffer(header.decode_u16(28)).get_string_from_utf8()
+		if sizes.has(name):
+			return {}
+		sizes[name] = size
+		file.seek(file.get_position() + header.decode_u16(30) + header.decode_u16(32))
+	return sizes
+
+func _archive_bytes(zr: ZIPReader, archive: String, name: String) -> PackedByteArray:
+	var key := str(_archive_fingerprints.get(archive, archive)) + "::" + name
+	if _archive_text.has(key):
+		return _archive_text[key]
+	var bytes := zr.read_file(name)
+	if bytes.size() <= 8 * 1024 * 1024 and _archive_text_bytes + bytes.size() <= 16 * 1024 * 1024:
+		_archive_text[key] = bytes
+		_archive_text_bytes += bytes.size()
+	return bytes
+
+func _save_snapshot_files(root_path: String, relative: String, paths: Array[String]) -> void:
+	var dir := DirAccess.open(root_path.path_join(relative))
+	if dir == null:
+		return
+	dir.list_dir_begin()
+	var name := dir.get_next()
+	while name != "":
+		var rel := relative.path_join(name)
+		if not name.begins_with(".") and not dir.is_link(name):
+			if dir.current_is_dir():
+				# SaveSystem uses numeric Steam IDs as subdirectories.
+				if relative.is_empty() and name.is_valid_int():
+					_save_snapshot_files(root_path, rel, paths)
+			elif name.ends_with(".save"):
+				paths.append(rel)
+		name = dir.get_next()
+
+func _snapshot_before_launch() -> bool:
+	if not _snapshot_enabled:
+		return true
+	var cfg := ConfigFile.new()
+	cfg.load(UI_CONFIG_PATH)
+	var signature := _configuration_signature()
+	if str(cfg.get_value("settings", "last_applied_loadout", "")) == signature:
+		return true
+	var paths: Array[String] = []
+	var user_path := ProjectSettings.globalize_path("user://")
+	_save_snapshot_files(user_path, "", paths)
+	var dest := user_path.path_join("orckit_save_snapshots").path_join("%d-%d" % [Time.get_unix_time_from_system(), Time.get_ticks_usec()])
+	var hashes := {}
+	for relative in paths:
+		var source := user_path.path_join(relative)
+		var target := dest.path_join(relative)
+		if DirAccess.make_dir_recursive_absolute(target.get_base_dir()) != OK:
+			return false
+		var before := FileAccess.get_sha256(source)
+		if before.is_empty() or DirAccess.copy_absolute(source, target) != OK or FileAccess.get_sha256(target) != before or FileAccess.get_sha256(source) != before:
+			return false
+		hashes[relative] = before
+	if not paths.is_empty():
+		var manifest := FileAccess.open(dest.path_join("manifest.json"), FileAccess.WRITE)
+		if manifest == null:
+			return false
+		manifest.store_string(JSON.stringify({"loadout": signature, "files": hashes}, "\t"))
+	return true
 
 
 static func _is_modloader_disabled() -> bool:
@@ -509,6 +657,12 @@ static func _mount_previous_session() -> Dictionary:
 		_static_reset_override_cfg(log_lines)
 		_write_filescope_log(log_lines)
 		return mounted
+	var saved_game_hash := str(cfg.get_value("state", "game_hash", ""))
+	var saved_loader_hash := str(cfg.get_value("state", "loader_hash", ""))
+	if saved_game_hash != FileAccess.get_sha256(OS.get_executable_path()) or saved_loader_hash != FileAccess.get_sha256(MODLOADER_RES_PATH):
+		_static_force_vanilla_state("game or loader content changed", log_lines)
+		_write_filescope_log(log_lines)
+		return mounted
 	var saved_exe_mtime: int = cfg.get_value("state", "exe_mtime", 0)
 	if saved_exe_mtime != 0:
 		var current_exe_mtime := FileAccess.get_modified_time(OS.get_executable_path())
@@ -528,10 +682,11 @@ static func _mount_previous_session() -> Dictionary:
 	log_lines.append("[FileScope] %d archive path(s) in pass state" % paths.size())
 
 	var any_missing := false
+	var archive_hashes: Dictionary = cfg.get_value("state", "archive_hashes", {})
 	for path in paths:
 		var abs_path := path if not path.begins_with("res://") and not path.begins_with("user://") \
 				else ProjectSettings.globalize_path(path)
-		if FileAccess.file_exists(abs_path):
+		if FileAccess.file_exists(abs_path) and archive_hashes.get(path, "") == FileAccess.get_sha256(abs_path):
 			log_lines.append("[FileScope]   EXISTS: " + abs_path)
 			continue
 		log_lines.append("[FileScope]   MISSING: " + abs_path)
@@ -790,12 +945,7 @@ func _ensure_early_autoload_on_disk(res_path: String, mod_name: String) -> Strin
 
 func _collect_enabled_archive_paths() -> PackedStringArray:
 	var paths := PackedStringArray()
-	var candidates: Array[Dictionary] = []
-	for entry in _ui_mod_entries:
-		if not entry["enabled"]:
-			continue
-		candidates.append(entry.duplicate())
-	candidates.sort_custom(_compare_load_order)
+	var candidates := _ordered_candidates(_ui_mod_entries)
 	for c in candidates:
 		if c["ext"] == "folder":
 			var folder_name: String = c["full_path"].get_file()
@@ -826,16 +976,7 @@ func _write_override_cfg(prepend_autoloads: Array[Dictionary]) -> Error:
 		return FileAccess.get_open_error()
 	f.store_string("\n".join(lines) + "\n" + preserved)
 	f.close()
-	if FileAccess.file_exists(path):
-		DirAccess.remove_absolute(path)
-	var dir := DirAccess.open(exe_dir)
-	if dir == null:
-		DirAccess.remove_absolute(tmp)
-		return ERR_CANT_OPEN
-	var err := dir.rename(tmp.get_file(), path.get_file())
-	if err != OK:
-		DirAccess.remove_absolute(tmp)
-	return err
+	return _replace_file_recoverably(path, tmp)
 
 func _persist_hook_pack_state(pack_path: String, wrapped_paths: PackedStringArray = PackedStringArray()) -> void:
 	var cfg := ConfigFile.new()
@@ -845,7 +986,7 @@ func _persist_hook_pack_state(pack_path: String, wrapped_paths: PackedStringArra
 	cfg.set_value("state", "hook_pack_exe_mtime", FileAccess.get_modified_time(OS.get_executable_path()))
 	if cfg.get_value("state", "modloader_version", "") == "":
 		cfg.set_value("state", "modloader_version", MODLOADER_VERSION)
-	if cfg.save(PASS_STATE_PATH) == OK:
+	if _save_config_recoverably(cfg, PASS_STATE_PATH) == OK:
 		_log_info("[OrcKitCodegen] Persisted hook pack path for next-session static-init mount: %s (%d wrapped path(s))" \
 				% [pack_path.get_file(), wrapped_paths.size()])
 
@@ -856,6 +997,12 @@ func _write_pass_state(archive_paths: PackedStringArray, state_hash: String = ""
 	cfg.set_value("state", "restart_count", count + 1)
 	cfg.set_value("state", "mods_hash", state_hash)
 	cfg.set_value("state", "archive_paths", archive_paths)
+	var archive_hashes := {}
+	for archive in archive_paths:
+		archive_hashes[archive] = FileAccess.get_sha256(archive)
+	cfg.set_value("state", "archive_hashes", archive_hashes)
+	cfg.set_value("state", "game_hash", FileAccess.get_sha256(OS.get_executable_path()))
+	cfg.set_value("state", "loader_hash", FileAccess.get_sha256(MODLOADER_RES_PATH))
 	cfg.set_value("state", "modloader_version", MODLOADER_VERSION)
 	cfg.set_value("state", "exe_mtime", FileAccess.get_modified_time(OS.get_executable_path()))
 	cfg.set_value("state", "timestamp", Time.get_unix_time_from_system())
@@ -863,7 +1010,7 @@ func _write_pass_state(archive_paths: PackedStringArray, state_hash: String = ""
 	for entry in _pending_script_overrides:
 		override_data.append(entry.duplicate())
 	cfg.set_value("state", "script_overrides", override_data)
-	var err := cfg.save(PASS_STATE_PATH)
+	var err := _save_config_recoverably(cfg, PASS_STATE_PATH)
 	if err != OK:
 		_log_critical("Failed to save pass state (error %d)" % err)
 	return err
@@ -873,9 +1020,8 @@ func _compute_state_hash(archive_paths: PackedStringArray, prepend_autoloads: Ar
 		return ""
 	var parts := PackedStringArray()
 	var sorted_paths := Array(archive_paths)
-	sorted_paths.sort()
 	for p in sorted_paths:
-		parts.append("a:%s@%d" % [p, FileAccess.get_modified_time(p)])
+		parts.append("a:%s@%s" % [p, FileAccess.get_sha256(p)])
 	for entry in prepend_autoloads:
 		parts.append("p:%s=%s" % [entry["name"], entry["path"]])
 	for entry in _ui_mod_entries:
@@ -889,7 +1035,9 @@ func _compute_state_hash(archive_paths: PackedStringArray, prepend_autoloads: Ar
 	var self_mtime: int = FileAccess.get_modified_time(MODLOADER_RES_PATH)
 	if self_mtime > 0:
 		parts.append("ml_mtime:%d" % self_mtime)
-	return "\n".join(parts).md5_text()
+	parts.append("game:" + FileAccess.get_sha256(OS.get_executable_path()))
+	parts.append("loader:" + FileAccess.get_sha256(MODLOADER_RES_PATH))
+	return "\n".join(parts).sha256_text()
 
 func _write_heartbeat() -> void:
 	var f := FileAccess.open(HEARTBEAT_PATH, FileAccess.WRITE)
@@ -970,7 +1118,7 @@ func _clear_restart_counter() -> void:
 	var cfg := ConfigFile.new()
 	if cfg.load(PASS_STATE_PATH) == OK:
 		cfg.set_value("state", "restart_count", 0)
-		cfg.save(PASS_STATE_PATH)
+		_save_config_recoverably(cfg, PASS_STATE_PATH)
 
 
 const _TEXT_SCAN_EXTS: Dictionary = {
@@ -1125,6 +1273,21 @@ func _security_compile_rules() -> void:
 			_log_warning("[SecurityScan] Failed to compile rule pattern: " + str(rule["id"]))
 
 func scan_mod(full_path: String, ext: String) -> Array:
+	var started := Time.get_ticks_usec()
+	var cache_key := ""
+	if ext != "folder":
+		var fingerprint := FileAccess.get_sha256(full_path)
+		_archive_fingerprints[full_path] = fingerprint
+		cache_key = fingerprint + "-" + MODLOADER_VERSION
+		cache_key += "-" + FileAccess.get_sha256(MODLOADER_RES_PATH)
+		if _scan_cache.has(cache_key):
+			return _scan_cache[cache_key].duplicate(true)
+		var cache_path := "user://orckit_analysis/" + cache_key + ".json"
+		if FileAccess.file_exists(cache_path):
+			var cached: Variant = JSON.parse_string(FileAccess.get_file_as_string(cache_path))
+			if cached is Array and _valid_cached_findings(cached):
+				_scan_cache[cache_key] = cached
+				return cached.duplicate(true)
 	_security_compile_rules()
 	var findings: Array = []
 	match ext:
@@ -1135,6 +1298,13 @@ func scan_mod(full_path: String, ext: String) -> Array:
 		"folder":
 			_security_scan_folder(full_path, "", findings)
 	findings.sort_custom(_security_sort_findings)
+	if not cache_key.is_empty():
+		_scan_cache[cache_key] = findings.duplicate(true)
+		DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("user://orckit_analysis"))
+		var cache_file := FileAccess.open("user://orckit_analysis/" + cache_key + ".json", FileAccess.WRITE)
+		if cache_file:
+			cache_file.store_string(JSON.stringify(findings))
+	_record_timing("scan", started)
 	return findings
 
 func _security_sort_findings(a: Dictionary, b: Dictionary) -> bool:
@@ -1145,6 +1315,10 @@ func _security_sort_findings(a: Dictionary, b: Dictionary) -> bool:
 	return int(a.get("line", 0)) < int(b.get("line", 0))
 
 func _security_scan_zip(zip_path: String, findings: Array) -> void:
+	var sizes := _zip_scan_sizes(zip_path)
+	if sizes.is_empty():
+		_scan_incomplete(findings, zip_path, "Archive exceeds scan limits, is unsupported, or is invalid")
+		return
 	var zr := ZIPReader.new()
 	if zr.open(zip_path) != OK:
 		return
@@ -1155,13 +1329,17 @@ func _security_scan_zip(zip_path: String, findings: Array) -> void:
 			continue
 		var ext := f.get_extension().to_lower()
 		if _TEXT_SCAN_EXTS.has(ext):
-			var bytes := zr.read_file(f)
+			if int(sizes.get(f, 0)) > _MAX_TEXT_SCAN_BYTES:
+				_scan_incomplete(findings, f, "Text exceeds scan limit")
+				continue
+			var bytes := _archive_bytes(zr, zip_path, f)
 			if bytes.size() > _MAX_TEXT_SCAN_BYTES:
+				_scan_incomplete(findings, "large text file", "Text exceeds scan limit")
 				continue
 			_security_scan_text(f, bytes.get_string_from_utf8(), findings)
 			continue
 		if _BINARY_SCAN_EXTS.has(ext) or ext == "gdc":
-			_security_scan_binary(f, zr.read_file(f), findings)
+			_security_scan_binary(f, _archive_bytes(zr, zip_path, f), findings)
 	zr.close()
 
 func _security_scan_folder(root: String, rel: String, findings: Array) -> void:
@@ -1183,9 +1361,14 @@ func _security_scan_folder(root: String, rel: String, findings: Array) -> void:
 			continue
 		var ext := entry.get_extension().to_lower()
 		var disk_path := root.path_join(rel_path)
+		var source_file := FileAccess.open(disk_path, FileAccess.READ)
+		if source_file == null or source_file.get_length() > _MAX_TEXT_SCAN_BYTES:
+			_scan_incomplete(findings, rel_path, "Unreadable file or scan size limit exceeded")
+			continue
 		if _TEXT_SCAN_EXTS.has(ext):
 			var bytes := FileAccess.get_file_as_bytes(disk_path)
 			if bytes.size() > _MAX_TEXT_SCAN_BYTES:
+				_scan_incomplete(findings, "large text file", "Text exceeds scan limit")
 				continue
 			_security_scan_text(rel_path, bytes.get_string_from_utf8(), findings)
 			continue
@@ -1197,6 +1380,7 @@ func _security_scan_folder(root: String, rel: String, findings: Array) -> void:
 func _security_scan_pck(pck_path: String, findings: Array) -> void:
 	var entries := _security_pck_list_with_offsets(pck_path)
 	if entries.is_empty():
+		_scan_incomplete(findings, pck_path, "No readable PCK entries")
 		return
 	var f := FileAccess.open(pck_path, FileAccess.READ)
 	if f == null:
@@ -1208,10 +1392,14 @@ func _security_scan_pck(pck_path: String, findings: Array) -> void:
 		var ext := path.get_extension().to_lower()
 		if not (_TEXT_SCAN_EXTS.has(ext) or _BINARY_SCAN_EXTS.has(ext) or ext == "gdc"):
 			continue
+		if int(entry["size"]) > _MAX_TEXT_SCAN_BYTES or int(entry["offset"]) < 0 or int(entry["offset"]) + int(entry["size"]) > f.get_length():
+			_scan_incomplete(findings, path, "Invalid extent or scan size limit exceeded")
+			continue
 		f.seek(int(entry["offset"]))
 		var bytes := f.get_buffer(int(entry["size"]))
 		if _TEXT_SCAN_EXTS.has(ext):
 			if bytes.size() > _MAX_TEXT_SCAN_BYTES:
+				_scan_incomplete(findings, "large text file", "Text exceeds scan limit")
 				continue
 			_security_scan_text(path, bytes.get_string_from_utf8(), findings)
 		else:
@@ -1319,7 +1507,7 @@ func _security_pck_list_with_offsets(pck_path: String) -> Array:
 		return result
 	f.get_32(); f.get_32(); f.get_32()
 	var pack_flags: int = f.get_32()
-	f.get_64()
+	var file_base := f.get_64()
 	if version == PACK_FORMAT_V3:
 		f.seek(f.get_64())
 	else:
@@ -1329,12 +1517,22 @@ func _security_pck_list_with_offsets(pck_path: String) -> Array:
 		f.close()
 		return result
 	var file_count: int = f.get_32()
+	if file_count > 100000:
+		return []
 	for i in file_count:
 		var path_len: int = f.get_32()
 		if path_len == 0 or path_len > 4096:
 			break
-		var path := f.get_buffer(path_len).get_string_from_utf8()
+		if f.get_position() + path_len + 36 > f.get_length():
+			return []
+		var path_bytes := f.get_buffer(path_len)
+		var terminator := path_bytes.find(0)
+		if terminator >= 0:
+			path_bytes.resize(terminator)
+		var path := path_bytes.get_string_from_utf8()
 		var offset: int = f.get_64()
+		if pack_flags & 2:
+			offset += file_base
 		var size: int = f.get_64()
 		f.get_buffer(16)
 		f.get_32()
@@ -1342,9 +1540,20 @@ func _security_pck_list_with_offsets(pck_path: String) -> Array:
 			result.append({"path": path, "offset": offset, "size": size})
 	f.close()
 	return result
+func _scan_incomplete(findings: Array, file: String, reason: String) -> void:
+	findings.append({"file": file, "line": 0, "rule": "incomplete_scan", "description": reason})
+
+func _valid_cached_findings(findings: Array) -> bool:
+	for finding in findings:
+		if not finding is Dictionary or not finding.get("file") is String or not finding.get("rule") is String or not finding.get("description") is String:
+			return false
+	return true
 
 
 func collect_mod_metadata() -> Array[Dictionary]:
+	var started := Time.get_ticks_usec()
+	_archive_text.clear()
+	_archive_text_bytes = 0
 	var entries: Array[Dictionary] = []
 	_mods_dir = OS.get_executable_path().get_base_dir().path_join(MOD_DIR)
 	_log_info("Scanning mods dir: " + _mods_dir)
@@ -1361,6 +1570,10 @@ func collect_mod_metadata() -> Array[Dictionary]:
 	dir.list_dir_begin()
 	while true:
 		var entry_name := dir.get_next()
+		if is_inside_tree():
+			if is_instance_valid(_scan_progress):
+				_scan_progress.text = "Inspecting mods: " + entry_name
+			await get_tree().process_frame
 		if entry_name == "":
 			break
 		if dir.current_is_dir():
@@ -1395,6 +1608,7 @@ func collect_mod_metadata() -> Array[Dictionary]:
 		for e in entries:
 			var tag := " [folder]" if e["ext"] == "folder" else ""
 			_log_info("  " + e["file_name"] + " (" + e["mod_name"] + ")" + tag)
+	_record_timing("discovery", started)
 	return entries
 
 func _build_archive_entry(mods_dir: String, file_name: String, ext: String) -> Dictionary:
@@ -1402,11 +1616,18 @@ func _build_archive_entry(mods_dir: String, file_name: String, ext: String) -> D
 	var full_path := mods_dir.path_join(file_name)
 	if ext == "pck":
 		_last_mod_txt_status = "pck"
-	var cfg: ConfigFile = read_mod_config(full_path) if ext != "pck" else null
+	var package_error := ""
+	if ext != "pck" and _zip_scan_sizes(full_path).is_empty():
+		package_error = "Archive invalid or exceeds supported limits (32 MiB/file, 256 MiB total, 10000 entries; no ZIP64/encryption)"
+	var cfg: ConfigFile = read_mod_config(full_path) if ext != "pck" and package_error.is_empty() else null
 	var entry := _entry_from_config(cfg, file_name, full_path, ext)
+	entry["package_error"] = package_error
 	entry["warnings"] = _build_entry_warnings(entry)
 	entry["security_findings"] = scan_mod(full_path, ext)
 	entry["risk_level"] = compute_risk_level(entry["security_findings"])
+	for finding in entry["security_findings"]:
+		if finding.get("rule") == "incomplete_scan":
+			entry["warnings"].append("Scan incomplete: " + str(finding["description"]))
 	_log_security_findings(entry)
 	return entry
 
@@ -1418,6 +1639,9 @@ func _build_folder_entry(mods_dir: String, dir_name: String) -> Dictionary:
 	entry["warnings"] = _build_entry_warnings(entry)
 	entry["security_findings"] = scan_mod(folder_path, "folder")
 	entry["risk_level"] = compute_risk_level(entry["security_findings"])
+	for finding in entry["security_findings"]:
+		if finding.get("rule") == "incomplete_scan":
+			entry["warnings"].append("Scan incomplete: " + str(finding["description"]))
 	_log_security_findings(entry)
 	return entry
 
@@ -1568,6 +1792,8 @@ func _resolve_entry_dependencies(entries: Array[Dictionary]) -> void:
 		by_id[str(entry.get("mod_id", "")).to_lower()] = entry
 	for entry: Dictionary in entries:
 		var errors: Array[String] = []
+		if not str(entry.get("package_error", "")).is_empty():
+			errors.append(entry["package_error"])
 		var warnings: Array[String] = []
 		for dep: Dictionary in entry.get("dependencies_required", []):
 			var issue := _dependency_issue(dep, by_id)
@@ -1587,6 +1813,8 @@ func _dependency_issue(dep: Dictionary, by_id: Dictionary) -> String:
 	var raw := str(dep.get("raw", dep_id))
 	if not by_id.has(dep_id):
 		return "Missing required dependency: " + raw
+	if not by_id[dep_id].get("enabled", false):
+		return "Required dependency disabled: " + raw
 	var op := str(dep.get("op", ""))
 	var version := str(dep.get("version", ""))
 	if op == "":
@@ -1690,6 +1918,37 @@ func _compare_dedup_priority(a: Dictionary, b: Dictionary) -> bool:
 		return am > bm
 	return (a["file_name"] as String).to_lower() < (b["file_name"] as String).to_lower()
 
+func _ordered_candidates(entries: Array[Dictionary]) -> Array[Dictionary]:
+	_resolve_entry_dependencies(entries)
+	var remaining: Array[Dictionary] = []
+	for entry in entries:
+		if entry.get("enabled", false) and not entry.get("dependency_blocked", false):
+			remaining.append(entry)
+	remaining.sort_custom(_compare_load_order)
+	var ordered: Array[Dictionary] = []
+	var ready: Dictionary = {}
+	while not remaining.is_empty():
+		var advanced := false
+		for i in remaining.size():
+			var entry := remaining[i]
+			var satisfied := true
+			for dep in entry.get("dependencies_required", []):
+				if not ready.has(str(dep["id"]).to_lower()):
+					satisfied = false
+			if satisfied:
+				ordered.append(entry)
+				ready[str(entry["mod_id"]).to_lower()] = true
+				remaining.remove_at(i)
+				advanced = true
+				break
+		if not advanced:
+			for entry in remaining:
+				entry["dependency_blocked"] = true
+				entry["dependency_errors"].append("Dependency cycle or blocked prerequisite")
+				entry["warnings"] = _build_entry_warnings(entry)
+			break
+	return ordered
+
 
 func load_all_mods(pass_label: String = "") -> void:
 	_pending_autoloads.clear()
@@ -1707,16 +1966,7 @@ func load_all_mods(pass_label: String = "") -> void:
 
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(TMP_DIR))
 
-	var candidates: Array[Dictionary] = []
-	for entry in _ui_mod_entries:
-		if not entry["enabled"]:
-			continue
-		if bool(entry.get("dependency_blocked", false)):
-			_log_warning("Skipping " + str(entry.get("mod_name", entry.get("file_name", "")))
-					+ " -- required dependencies are missing or incompatible.")
-			continue
-		candidates.append(entry.duplicate())
-	candidates.sort_custom(_compare_load_order)
+	var candidates := _ordered_candidates(_ui_mod_entries)
 
 	if candidates.is_empty():
 		_log_info("No mods enabled.")
@@ -1739,7 +1989,19 @@ func load_all_mods(pass_label: String = "") -> void:
 	_log_info("=" .repeat(header.length()))
 
 	for load_index in candidates.size():
-		_process_mod_candidate(candidates[load_index], load_index)
+		var candidate := candidates[load_index]
+		var prerequisites_loaded := true
+		for dep in candidate.get("dependencies_required", []):
+			var found := false
+			for id in _loaded_mod_ids:
+				if str(id).to_lower() == str(dep["id"]).to_lower():
+					found = true
+			if not found:
+				prerequisites_loaded = false
+		if prerequisites_loaded:
+			_process_mod_candidate(candidate, load_index)
+		else:
+			_log_warning("Skipping %s: a prerequisite failed to load" % candidate["mod_name"])
 
 	_merge_hook_calls_into_wrap_mask()
 
@@ -2009,6 +2271,7 @@ func _apply_script_overrides() -> void:
 
 func scan_and_register_archive_claims(archive_path: String, mod_name: String,
 		archive_file: String, load_index: int) -> void:
+	_archive_fingerprints[archive_path] = FileAccess.get_sha256(archive_path)
 	var zr := ZIPReader.new()
 	if zr.open(archive_path) != OK:
 		_log_warning("  Could not scan archive: " + archive_file)
@@ -2047,7 +2310,7 @@ func scan_and_register_archive_claims(archive_path: String, mod_name: String,
 	for f in files:
 		if f.get_extension().to_lower() == "gd":
 			gd_analysis["total_gd_files"] = gd_analysis["total_gd_files"] + 1
-			var gd_bytes := zr.read_file(f)
+			var gd_bytes := _archive_bytes(zr, archive_path, f)
 			if gd_bytes.size() > 0:
 				var gd_text := gd_bytes.get_string_from_utf8()
 				_scan_gd_source(gd_text, gd_analysis)
@@ -2307,12 +2570,13 @@ func _write_conflict_report() -> void:
 	f.close()
 	_log_info("Conflict report written to: " + CONFLICT_REPORT_PATH)
 
-
 func _load_developer_mode_setting() -> void:
 	var cfg := ConfigFile.new()
 	if cfg.load(UI_CONFIG_PATH) != OK:
 		return
 	_developer_mode = bool(cfg.get_value("settings", "developer_mode", false))
+	_snapshot_enabled = bool(cfg.get_value("settings", "save_snapshots", false))
+	_diagnostics_enabled = bool(cfg.get_value("settings", "diagnostics", false))
 	if _developer_mode:
 		_log_info("Developer mode: ON")
 
@@ -2336,7 +2600,7 @@ func _load_ui_config() -> void:
 			for key: String in cfg.get_section_keys("priority"):
 				cfg.set_value("profile.Default.priority", key, cfg.get_value("priority", key))
 
-	_active_profile = "Default"
+	_active_profile = str(cfg.get_value("settings", "active_profile", "Default"))
 
 	_apply_profile_to_entries(cfg, _active_profile)
 
@@ -2384,9 +2648,8 @@ func _save_per_profile_setting(key: String, value: Variant) -> void:
 	cfg.load(UI_CONFIG_PATH)
 	var sec := "profile." + _active_profile + ".settings"
 	cfg.set_value(sec, key, value)
-	cfg.save(UI_CONFIG_PATH)
-	if _boot_complete:
-		_dirty_since_boot = true
+	_save_preferences(cfg)
+	refresh_launch_button_label()
 
 func _mods_entry_visible(entry: Dictionary) -> bool:
 	if _mods_hide_disabled and not bool(entry.get("enabled", false)):
@@ -2475,9 +2738,10 @@ func _save_ui_config() -> void:
 
 	cfg.set_value("settings", "developer_mode", _developer_mode)
 	cfg.set_value("settings", "active_profile", _active_profile)
-	cfg.save(UI_CONFIG_PATH)
-	if _boot_complete:
-		_dirty_since_boot = true
+	cfg.set_value("settings", "save_snapshots", _snapshot_enabled)
+	cfg.set_value("settings", "diagnostics", _diagnostics_enabled)
+	_save_preferences(cfg)
+	refresh_launch_button_label()
 
 func _missing_mods_in_active_profile() -> Array[String]:
 	var cfg := ConfigFile.new()
@@ -2515,7 +2779,7 @@ func _remove_missing_entry_from_profile(stored_key: String) -> void:
 		var sec := "profile." + _active_profile + suffix
 		if cfg.has_section(sec) and cfg.has_section_key(sec, stored_key):
 			cfg.erase_section_key(sec, stored_key)
-	cfg.save(UI_CONFIG_PATH)
+	_save_preferences(cfg)
 
 func _remove_all_missing_entries_from_profile() -> void:
 	var missing := _missing_mods_in_active_profile()
@@ -2531,7 +2795,7 @@ func _remove_all_missing_entries_from_profile() -> void:
 		for key: String in missing:
 			if cfg.has_section_key(sec, key):
 				cfg.erase_section_key(sec, key)
-	cfg.save(UI_CONFIG_PATH)
+	_save_preferences(cfg)
 
 func _rebuild_mods_tab(tabs: TabContainer) -> void:
 	var old := tabs.get_node_or_null("Mods")
@@ -2721,7 +2985,9 @@ func _ui_button_style(btn: Button, bg: Color, border: Color, hover: Color, press
 	btn.add_theme_color_override("font_color", Color(0.89, 0.93, 0.82))
 	btn.add_theme_color_override("font_hover_color", Color(1.0, 1.0, 1.0))
 
-func show_mod_ui() -> void:
+func show_mod_ui() -> String:
+	_ui_finishing = false
+	var previous_focus := get_viewport().gui_get_focus_owner()
 	var layer := CanvasLayer.new()
 	layer.name = "OrcKitUILayer"
 	layer.layer = 8192
@@ -2804,7 +3070,7 @@ func show_mod_ui() -> void:
 	title_stack.add_child(title)
 
 	var subtitle := Label.new()
-	subtitle.text = "Mod loadout manager for Sir, We Have an Orc Problem Playtest"
+	subtitle.text = "Mod loadout manager for Sir, We Have an Orc Problem"
 	subtitle.add_theme_font_size_override("font_size", 12)
 	subtitle.modulate = Color(0.64, 0.70, 0.58)
 	title_stack.add_child(subtitle)
@@ -2828,6 +3094,12 @@ func show_mod_ui() -> void:
 	var version_box := PanelContainer.new()
 	version_box.add_theme_stylebox_override("panel", _ui_box(Color(0.034, 0.042, 0.036), Color(0.17, 0.23, 0.15), 10, 7))
 	header.add_child(version_box)
+	if _boot_complete:
+		var close_button := Button.new()
+		close_button.text = "×"
+		close_button.tooltip_text = "Close (Esc)"
+		close_button.pressed.connect(_request_ui_close)
+		header.add_child(close_button)
 	var version_lbl := Label.new()
 	version_lbl.text = "OrcKit " + MODLOADER_VERSION
 	version_lbl.add_theme_font_size_override("font_size", 11)
@@ -2845,7 +3117,7 @@ func show_mod_ui() -> void:
 		warn_box.add_child(warn_lbl)
 
 	var tabs := TabContainer.new()
-	tabs.tabs_visible = false
+	tabs.tabs_visible = true
 	tabs.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	root.add_child(tabs)
 
@@ -2867,30 +3139,43 @@ func show_mod_ui() -> void:
 	launch_btn.custom_minimum_size = Vector2(230, 44)
 	_ui_button_style(launch_btn, Color(0.20, 0.31, 0.13), Color(0.58, 0.74, 0.35), Color(0.28, 0.42, 0.18), Color(0.13, 0.20, 0.09))
 
+	if _boot_complete:
+		var back := Button.new()
+		_ui_back_button = back
+		back.text = "Back to Game"
+		back.pressed.connect(_request_ui_close)
+		bottom.add_child(back)
 	bottom.add_child(launch_btn)
 	_ui_launch_btn = launch_btn
 
 	var mods_tab := build_mods_tab(tabs)
 	mods_tab.name = "Mods"
 	tabs.add_child(mods_tab)
+	tabs.add_child(_build_settings_tab())
 
 	refresh_launch_button_label()
 
-	while true:
-		await launch_btn.pressed
-		var red_mods := _enabled_red_mods()
-		if red_mods.is_empty():
-			break
-		var proceed: bool = await _confirm_red_launch(red_mods)
-		if proceed:
-			break
+	launch_btn.pressed.connect(_request_ui_launch)
+	var action: String = await ui_finished
 	_ui_window = null
+	_ui_back_button = null
 	_ui_hint_label = null
 	_ui_launch_btn = null
 	layer.queue_free()
+	if is_instance_valid(previous_focus):
+		previous_focus.grab_focus()
+	return action
 
 func refresh_launch_button_label() -> void:
 	if not is_instance_valid(_ui_launch_btn):
+		return
+	if _boot_complete:
+		var pending := _has_pending_changes()
+		if is_instance_valid(_ui_back_button):
+			_ui_back_button.visible = pending
+		_ui_launch_btn.text = "Apply and Restart" if pending else "Back to Game"
+		if is_instance_valid(_ui_hint_label):
+			_ui_hint_label.text = "Restart required — saved changes apply next launch." if pending else "Current mods are running. No restart required."
 		return
 	var any_enabled := false
 	for entry in _ui_mod_entries:
@@ -3331,7 +3616,7 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 		for child in order_list.get_children():
 			child.queue_free()
 		var sorted := _ui_mod_entries.filter(func(e): return e["enabled"])
-		sorted.sort_custom(_compare_load_order)
+		sorted = _ordered_candidates(_ui_mod_entries)
 		if sorted.is_empty():
 			var lbl := Label.new()
 			lbl.text = "No armed mods yet."
@@ -3364,15 +3649,15 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 
 	dev_check.toggled.connect(func(on: bool):
 		_developer_mode = on
-		_ui_mod_entries = collect_mod_metadata()
+		_save_ui_config()
+		_ui_mod_entries = await _discover_with_progress()
 		_load_ui_config()
 		_rebuild_mods_tab(tabs)
 	)
 
 	filter_edit.text_changed.connect(func(t: String):
 		_mods_filter_text = t
-		_mods_filter_focus_pending = true
-		_rebuild_mods_tab(tabs)
+		_filter_mod_rows()
 	)
 	all_btn.pressed.connect(func():
 		for entry in _ui_mod_entries:
@@ -3391,7 +3676,7 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 	hide_check.toggled.connect(func(on: bool):
 		_mods_hide_disabled = on
 		_save_per_profile_setting("hide_disabled", on)
-		_rebuild_mods_tab(tabs)
+		_filter_mod_rows()
 	)
 
 	var missing_files := _missing_mods_in_active_profile()
@@ -3456,10 +3741,9 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 		empty.add_theme_font_size_override("font_size", 13)
 		empty_panel.add_child(empty)
 
+	_ui_rows.clear()
 	var rendered_any := false
 	for entry in _ui_mod_entries:
-		if not _mods_entry_visible(entry):
-			continue
 		rendered_any = true
 		var row_panel := PanelContainer.new()
 		row_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -3467,6 +3751,8 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 		var row_border := Color(0.25, 0.38, 0.16) if entry["enabled"] else Color(0.11, 0.15, 0.10)
 		row_panel.add_theme_stylebox_override("panel", _ui_box(row_bg, row_border, 0, 8))
 		list.add_child(row_panel)
+		row_panel.visible = _mods_entry_visible(entry)
+		_ui_rows.append({"control": row_panel, "entry": entry})
 
 		var row_pad := MarginContainer.new()
 		row_pad.add_theme_constant_override("margin_left", 10)
@@ -3593,6 +3879,7 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 			refresh_order.call()
 			refresh_summary.call()
 			_save_ui_config()
+			_filter_mod_rows()
 		)
 		spin.value_changed.connect(func(val: float):
 			e["priority"] = int(val)
@@ -3618,6 +3905,162 @@ func build_mods_tab(tabs: TabContainer) -> Control:
 	refresh_summary.call()
 	return outer
 
+# Compare effective loadouts, not whether a save callback happened.
+func _configuration_signature() -> String:
+	var selected: Array[Dictionary] = []
+	for entry in _ui_mod_entries:
+		if entry.get("enabled", false):
+			selected.append(entry)
+	selected.sort_custom(_compare_load_order)
+	var parts := PackedStringArray()
+	for entry in selected:
+		parts.append("%s|%s|%s" % [entry["mod_id"], entry["version"], entry["full_path"]])
+	return "\n".join(parts).sha256_text()
+
+func _has_pending_changes() -> bool:
+	return _boot_complete and _configuration_signature() != _running_configuration
+
+func _input(event: InputEvent) -> void:
+	if not is_instance_valid(_ui_window) or not event.is_action_pressed("ui_cancel") or event.is_echo():
+		return
+	# Child dialogs own Escape; never dismiss two layers with one keypress.
+	for child in _ui_window.get_children():
+		if child is Window and child.visible:
+			return
+	get_viewport().set_input_as_handled()
+	_request_ui_close()
+
+func _request_ui_close() -> void:
+	if not _boot_complete or _ui_finishing or is_instance_valid(_close_dialog):
+		return
+	if not _has_pending_changes():
+		_finish_ui("close")
+		return
+	_close_dialog = ConfirmationDialog.new()
+	_close_dialog.title = "Restart required"
+	_close_dialog.dialog_text = "Mod changes require a restart.\nYour current session will continue using the previously loaded mods."
+	_close_dialog.ok_button_text = "Restart now"
+	_close_dialog.cancel_button_text = "Keep editing"
+	_close_dialog.add_button("Save for next launch", false, "later")
+	_attach_ui_dialog(_close_dialog)
+	_close_dialog.confirmed.connect(func(): _close_dialog.queue_free(); _request_ui_launch())
+	_close_dialog.canceled.connect(func(): _close_dialog.queue_free())
+	_close_dialog.close_requested.connect(func(): _close_dialog.queue_free())
+	_close_dialog.custom_action.connect(func(action: String):
+		if action == "later":
+			_close_dialog.queue_free()
+			_finish_ui("close")
+	)
+	_close_dialog.popup_centered()
+	_close_dialog.get_cancel_button().grab_focus()
+
+func _finish_ui(action: String) -> void:
+	if _ui_finishing:
+		return
+	_save_ui_config()
+	if _save_error != OK:
+		_show_save_error()
+		return
+	if action in ["launch", "restart"] and not _snapshot_before_launch():
+		var dialog := AcceptDialog.new()
+		dialog.dialog_text = "Save backup failed. Launch cancelled; existing saves were not changed."
+		_attach_ui_dialog(dialog)
+		dialog.confirmed.connect(dialog.queue_free)
+		dialog.close_requested.connect(dialog.queue_free)
+		dialog.popup_centered()
+		return
+	_ui_finishing = true
+	ui_finished.emit(action)
+
+func _request_ui_launch() -> void:
+	if _boot_complete and not _has_pending_changes():
+		_finish_ui("close")
+		return
+	var red_mods := _enabled_red_mods()
+	if not red_mods.is_empty() and not await _confirm_red_launch(red_mods):
+		return
+	_finish_ui("restart" if _boot_complete and _has_pending_changes() else "launch")
+
+func _filter_mod_rows() -> void:
+	for row in _ui_rows:
+		if is_instance_valid(row["control"]):
+			row["control"].visible = _mods_entry_visible(row["entry"])
+
+func _save_preferences(cfg: ConfigFile) -> Error:
+	_save_error = _save_config_recoverably(cfg, UI_CONFIG_PATH)
+	if _save_error != OK:
+		_log_critical("Could not save mod preferences: %d" % _save_error)
+	return _save_error
+
+func _show_save_error() -> void:
+	var dialog := AcceptDialog.new()
+	dialog.dialog_text = "Could not save mod settings. Check available disk space and folder permissions."
+	_attach_ui_dialog(dialog)
+	dialog.confirmed.connect(dialog.queue_free)
+	dialog.close_requested.connect(dialog.queue_free)
+	dialog.popup_centered()
+
+func _build_settings_tab() -> Control:
+	var box := VBoxContainer.new()
+	box.name = "Settings"
+	box.add_theme_constant_override("separation", 12)
+	var info := Label.new()
+	info.text = "Game: %s\nEngine: %s\nExecutable: %s\nMods: %s\nScript discovery: %s" % [ProjectSettings.get_setting("application/config/version", "unknown"), Engine.get_version_info()["string"], OS.get_executable_path(), _mods_dir, _script_discovery_source]
+	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	box.add_child(info)
+	var snapshot := CheckBox.new()
+	snapshot.text = "Back up saves before launching a changed mod loadout"
+	snapshot.button_pressed = _snapshot_enabled
+	snapshot.toggled.connect(func(on: bool): _snapshot_enabled = on; _save_ui_config())
+	box.add_child(snapshot)
+	var diagnostics := CheckBox.new()
+	diagnostics.text = "Record loader performance diagnostics"
+	diagnostics.button_pressed = _diagnostics_enabled
+	diagnostics.toggled.connect(func(on: bool): _diagnostics_enabled = on; _save_ui_config())
+	box.add_child(diagnostics)
+	if _diagnostics_enabled:
+		var timings := Label.new()
+		timings.text = "Accumulated timings (microseconds): " + JSON.stringify(_performance)
+		timings.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		box.add_child(timings)
+	for key in _mod_settings:
+		var setting: Dictionary = _mod_settings[key]
+		var row := HBoxContainer.new()
+		var label := Label.new()
+		label.text = setting["label"]
+		row.add_child(label)
+		var select := OptionButton.new()
+		var choices: Array = setting["choices"]
+		var current: Variant = get_mod_setting(setting["mod_id"], setting["key"], setting["default"])
+		for i in choices.size():
+			select.add_item(str(choices[i]))
+			if choices[i] == current:
+				select.select(i)
+		select.item_selected.connect(func(index: int):
+			var cfg := ConfigFile.new()
+			cfg.load(UI_CONFIG_PATH)
+			cfg.set_value("mod_settings." + setting["mod_id"], setting["key"], choices[index])
+			if _save_preferences(cfg) == OK and setting["callback"].is_valid():
+				setting["callback"].call(choices[index])
+		)
+		row.add_child(select)
+		box.add_child(row)
+	return box
+
+func _discover_with_progress() -> Array[Dictionary]:
+	var layer := CanvasLayer.new()
+	layer.layer = 8193
+	layer.process_mode = Node.PROCESS_MODE_ALWAYS
+	get_tree().root.add_child(layer)
+	_scan_progress = Label.new()
+	_scan_progress.text = "Inspecting mods…"
+	_scan_progress.position = Vector2(24, 24)
+	layer.add_child(_scan_progress)
+	var entries := await collect_mod_metadata()
+	_scan_progress = null
+	layer.queue_free()
+	return entries
+
 
 static func version() -> String:
 	return MODLOADER_VERSION
@@ -3639,6 +4082,11 @@ func _register_orcmodlib_meta() -> void:
 	_log_info("[OrcmodLib] modloader registered as Engine.meta('OrcmodLib')")
 
 func _emit_frameworks_ready() -> void:
+	_running_configuration = _configuration_signature()
+	var applied := ConfigFile.new()
+	applied.load(UI_CONFIG_PATH)
+	applied.set_value("settings", "last_applied_loadout", _running_configuration)
+	_save_preferences(applied)
 	_is_ready = true
 	_register_core_hooks()
 	_scene_nodes_connect_listener()
@@ -3668,8 +4116,10 @@ func hook(hook_name: String, callback: Callable, priority: int = 100) -> int:
 	if not _hooks.has(hook_name):
 		_hooks[hook_name] = []
 	var entry := { "callback": callback, "priority": priority, "id": _next_id }
-	(_hooks[hook_name] as Array).append(entry)
-	(_hooks[hook_name] as Array).sort_custom(func(a, b): return a["priority"] < b["priority"])
+	var updated: Array = _hooks[hook_name].duplicate()
+	updated.append(entry)
+	updated.sort_custom(func(a, b): return a["priority"] < b["priority"] if a["priority"] != b["priority"] else a["id"] < b["id"])
+	_hooks[hook_name] = updated
 	_any_mod_hooked = true
 	var base := _hook_base_of(hook_name)
 	_hooked_bases[base] = int(_hooked_bases.get(base, 0)) + 1
@@ -3700,10 +4150,11 @@ func hook_many(entries: Dictionary, priority: int = 100) -> Dictionary:
 
 func unhook(hook_id: int) -> void:
 	for hook_name in _hooks:
-		var arr: Array = _hooks[hook_name]
+		var arr: Array = _hooks[hook_name].duplicate()
 		for i in range(arr.size() - 1, -1, -1):
 			if arr[i]["id"] == hook_id:
 				arr.remove_at(i)
+				_hooks[hook_name] = arr
 				var base := _hook_base_of(hook_name)
 				var c: int = int(_hooked_bases.get(base, 0)) - 1
 				if c <= 0:
@@ -3881,22 +4332,29 @@ func _to_version_int(s: String) -> int:
 
 
 func _dispatch(hook_name: String, args: Array) -> void:
+	var started := Time.get_ticks_usec() if _diagnostics_enabled else 0
 	if not _hooks.has(hook_name):
 		return
-	var entries: Array = (_hooks[hook_name] as Array).duplicate()
+	var entries: Array = _hooks[hook_name]
 	for entry in entries:
 		_seq += 1
 		var cb: Callable = entry["callback"]
+		if not cb.is_valid():
+			continue
 		cb.callv(args)
+	if _diagnostics_enabled:
+		_record_timing("hook:" + hook_name, started)
 
 func _dispatch_post(hook_name: String, args: Array, current_result: Variant) -> Variant:
 	if not _hooks.has(hook_name):
 		return current_result
-	var entries: Array = (_hooks[hook_name] as Array).duplicate()
+	var entries: Array = _hooks[hook_name]
 	var expected_with_result: int = args.size() + 1
 	for entry in entries:
 		_seq += 1
 		var cb: Callable = entry["callback"]
+		if not cb.is_valid():
+			continue
 		var argc: int = cb.get_argument_count()
 		var ret: Variant = null
 		if argc == expected_with_result:
@@ -3915,10 +4373,12 @@ func _dispatch_post(hook_name: String, args: Array, current_result: Variant) -> 
 func _dispatch_deferred(hook_name: String, args: Array) -> void:
 	if not _hooks.has(hook_name):
 		return
-	var entries: Array = (_hooks[hook_name] as Array).duplicate()
+	var entries: Array = _hooks[hook_name]
 	for entry in entries:
 		_seq += 1
 		var cb: Callable = entry["callback"]
+		if not cb.is_valid():
+			continue
 		cb.bindv(args).call_deferred()
 
 func _get_hooks(hook_name: String) -> Array:
@@ -3928,6 +4388,18 @@ func _get_hooks(hook_name: String) -> Array:
 	for entry in _hooks[hook_name]:
 		callbacks.append(entry["callback"])
 	return callbacks
+
+# Settings are opt-in and apply live through the mod's callback; no loader restart.
+func register_mod_setting(mod_id: String, key: String, label: String, choices: Array, default_value: Variant, callback: Callable) -> bool:
+	if mod_id.is_empty() or key.is_empty() or choices.is_empty() or not default_value in choices or not callback.is_valid():
+		return false
+	_mod_settings[mod_id + "/" + key] = {"mod_id": mod_id, "key": key, "label": label, "choices": choices.duplicate(), "default": default_value, "callback": callback}
+	return true
+
+func get_mod_setting(mod_id: String, key: String, default_value: Variant = null) -> Variant:
+	var cfg := ConfigFile.new()
+	cfg.load(UI_CONFIG_PATH)
+	return cfg.get_value("mod_settings." + mod_id, key, default_value)
 
 
 const Registry := {
@@ -3980,7 +4452,7 @@ func patch(registry: String, id: Variant, fields: Dictionary) -> bool:
 	if not (id is String) or String(id) == "":
 		push_warning("[Registry] patch('%s', ...): id must be a non-empty String" % registry)
 		return false
-	var current := get_entry(registry, id)
+	var current: Variant = get_entry(registry, id)
 	if current == null:
 		_registry_warn_unsupported("patch", registry)
 		return false
@@ -4017,7 +4489,7 @@ func _array_op(registry: String, id: Variant, field: String, values: Variant, op
 	if not (id is String):
 		push_warning("[Registry] %s('%s', ...): id must be a String" % [op, registry])
 		return false
-	var current := get_entry(registry, String(id))
+	var current: Variant = get_entry(registry, String(id))
 	if current == null or not (current is Object):
 		_registry_warn_unsupported(op, registry)
 		return false
@@ -4033,7 +4505,7 @@ func _array_op(registry: String, id: Variant, field: String, values: Variant, op
 	var stash: Dictionary = reg_patch[id]
 	if not stash.has(field):
 		stash[field] = (existing as Array).duplicate()
-	var incoming := values if values is Array else [values]
+	var incoming: Array = values if values is Array else [values]
 	match op:
 		"append":
 			for value in incoming:
@@ -4073,7 +4545,7 @@ func revert(registry: String, id: Variant, fields: Array = []) -> bool:
 		(_registry_overridden[registry] as Dictionary).erase(sid)
 		changed = true
 	if _registry_patched.has(registry) and (_registry_patched[registry] as Dictionary).has(sid):
-		var current := get_entry(registry, sid)
+		var current: Variant = get_entry(registry, sid)
 		if current is Object:
 			var stash: Dictionary = (_registry_patched[registry] as Dictionary)[sid]
 			var names := fields if not fields.is_empty() else stash.keys()
@@ -4375,7 +4847,6 @@ func _bind_register_attachment() -> Callable: return Callable(self, "register_at
 func _bind_register_furniture() -> Callable:  return Callable(self, "register_furniture")
 func _bind_register_ai_loadout() -> Callable: return Callable(self, "register_ai_loadout")
 
-
 func _rtv_collect_nodes_by_class(node: Node, cls_name: String, out: Array) -> void:
 	var scr := node.get_script() as GDScript
 	if scr != null:
@@ -4392,7 +4863,6 @@ func _rtv_collect_nodes_by_class(node: Node, cls_name: String, out: Array) -> vo
 			out.append(node)
 	for child in node.get_children():
 		_rtv_collect_nodes_by_class(child, cls_name, out)
-
 
 
 const _GDSC_MAGIC := "GDSC"
@@ -4942,7 +5412,7 @@ func _enumerate_game_scripts() -> Array[String]:
 	if not _all_game_script_paths.is_empty():
 		return _all_game_script_paths
 	var exe_dir := OS.get_executable_path().get_base_dir()
-	var candidates := [OS.get_executable_path().get_file().get_basename() + ".pck"]
+	var candidates := [OS.get_executable_path().get_file().get_basename() + ".pck", OS.get_executable_path().get_file()]
 	for cand in candidates:
 		var pck_path := exe_dir.path_join(cand)
 		if not FileAccess.file_exists(pck_path):
@@ -4968,8 +5438,10 @@ func _enumerate_game_scripts() -> Array[String]:
 				scripts.append(canonical)
 		_log_info("[OrcKitCodegen] parsed %s -- %d total file(s), %d game script(s)" \
 				% [cand, paths.size(), scripts.size()])
+		_script_discovery_source = cand
 		_all_game_script_paths = scripts
 		return scripts
+	_script_discovery_source = "Compatibility fallback: playtest manifest (unverified build)"
 	_all_game_script_paths = GAME_SCRIPT_PATHS.duplicate()
 	_log_info("[OrcKitCodegen] using embedded playtest script manifest (%d game script paths)" \
 			% _all_game_script_paths.size())
@@ -5007,11 +5479,19 @@ func _parse_pck_file_list(pck_path: String) -> PackedStringArray:
 		_log_warning("[PCK] cannot open: %s" % pck_path)
 		return result
 
+	var pack_start := 0
 	var magic: int = f.get_32()
 	if magic != MAGIC_GDPC:
-		_log_warning("[PCK] %s: not a standalone PCK (magic=0x%x)" % [pck_path, magic])
-		f.close()
-		return result
+		if f.get_length() < 12:
+			return result
+		f.seek(f.get_length() - 12)
+		var pack_size := f.get_64()
+		if f.get_32() != MAGIC_GDPC or pack_size > f.get_length() - 12:
+			return result
+		pack_start = f.get_length() - 12 - pack_size
+		f.seek(pack_start)
+		if f.get_32() != MAGIC_GDPC:
+			return result
 
 	var pack_format_version: int = f.get_32()
 	if pack_format_version < PACK_FORMAT_V2 or pack_format_version > PACK_FORMAT_V3:
@@ -5026,7 +5506,7 @@ func _parse_pck_file_list(pck_path: String) -> PackedStringArray:
 	f.get_64()
 
 	if pack_format_version == PACK_FORMAT_V3:
-		f.seek(f.get_64())
+		f.seek(pack_start + f.get_64())
 	else:
 		for i in 16:
 			f.get_32()
@@ -5037,13 +5517,21 @@ func _parse_pck_file_list(pck_path: String) -> PackedStringArray:
 		return result
 
 	var file_count: int = f.get_32()
+	if file_count > 100000:
+		return result
 	for i in file_count:
 		var path_len: int = f.get_32()
 		if path_len == 0 or path_len > 4096:
 			_log_warning("[PCK] %s: suspicious path_len=%d at entry %d -- abort" \
 					% [pck_path, path_len, i])
 			break
-		var path := f.get_buffer(path_len).get_string_from_utf8()
+		if f.get_position() + path_len + 36 > f.get_length():
+			return PackedStringArray()
+		var path_bytes := f.get_buffer(path_len)
+		var terminator := path_bytes.find(0)
+		if terminator >= 0:
+			path_bytes.resize(terminator)
+		var path := path_bytes.get_string_from_utf8()
 		f.get_64()
 		var size: int = f.get_64()
 		f.get_buffer(16)
@@ -5056,7 +5544,6 @@ func _parse_pck_file_list(pck_path: String) -> PackedStringArray:
 
 	f.close()
 	return result
-
 
 func _compile_regex() -> void:
 	_re_take_over = RegEx.new()
@@ -6030,6 +6517,7 @@ func _activate_rewritten_scripts(script_paths: Array[String], pack_path: String)
 		_log_info("[OrcKitCodegen] DEFER %d script(s) with module-scope scene preload -- will lazy-compile via VFS after mod overrides: %s" \
 				% [deferred.size(), ", ".join(Array(deferred))])
 
+	var inspections := {}
 	var pre_a := 0
 	var pre_b := 0
 	var pre_c := 0
@@ -6044,6 +6532,7 @@ func _activate_rewritten_scripts(script_paths: Array[String], pack_path: String)
 			pre_d += 1
 			continue
 		var pre_rename := _script_has_rewritten_methods(c)
+		inspections[vp] = {"script": c, "rewritten": pre_rename}
 		var srclen: int = c.source_code.length()
 		if pre_rename:
 			pre_a += 1
@@ -6067,12 +6556,12 @@ func _activate_rewritten_scripts(script_paths: Array[String], pack_path: String)
 	for vp: String in script_paths:
 		if _scripts_with_scene_preloads.has(vp):
 			continue
-		var cached := load(vp) as GDScript
+		var cached: GDScript = inspections.get(vp, {}).get("script")
 		if cached == null:
 			_log_warning("[OrcKitCodegen] activate %s: load returned null -- skip" % vp)
 			continue
 
-		var already_live := _script_has_rewritten_methods(cached)
+		var already_live: bool = inspections[vp]["rewritten"]
 		if already_live:
 			var fresh_source := FileAccess.get_file_as_string(vp)
 			if not fresh_source.is_empty() and fresh_source != cached.source_code:
@@ -6278,6 +6767,7 @@ func _activate_rewritten_scripts(script_paths: Array[String], pack_path: String)
 
 
 func _ready() -> void:
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	if _has_loaded:
 		return
 	_has_loaded = true
@@ -6321,9 +6811,8 @@ func _preserve_engine_driver_args(args: Array) -> void:
 func reopen_mod_ui() -> void:
 	if _ui_window != null:
 		return
-	_dirty_since_boot = false
-	await show_mod_ui()
-	if _dirty_since_boot:
+	var action := await show_mod_ui()
+	if action == "restart":
 		_log_info("[OrcKit] Post-boot mod changes detected -- restarting")
 		_modloader_restart(true)
 
@@ -6335,7 +6824,7 @@ func _run_pass_1() -> void:
 	_build_class_name_lookup()
 	_enumerate_game_scripts()
 	_load_developer_mode_setting()
-	_ui_mod_entries = collect_mod_metadata()
+	_ui_mod_entries = await _discover_with_progress()
 	_clean_stale_cache()
 	_load_ui_config()
 	await show_mod_ui()
@@ -6479,7 +6968,7 @@ func _run_pass_2() -> void:
 	_build_class_name_lookup()
 	_enumerate_game_scripts()
 	_load_developer_mode_setting()
-	_ui_mod_entries = collect_mod_metadata()
+	_ui_mod_entries = await _discover_with_progress()
 	_load_ui_config()
 
 	load_all_mods("Pass 2")

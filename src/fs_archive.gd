@@ -279,3 +279,124 @@ func _zip_folder_recursive(zp: ZIPPacker, disk_path: String, archive_prefix: Str
 			zp.write_file(data)
 			zp.close_file()
 	dir.list_dir_end()
+static func _replace_file_recoverably(path: String, tmp: String) -> Error:
+	var backup := path + ".bak"
+	var had_original := FileAccess.file_exists(path)
+	if had_original:
+		if FileAccess.file_exists(backup):
+			var remove_error := DirAccess.remove_absolute(backup)
+			if remove_error != OK:
+				return remove_error
+		var backup_error := DirAccess.copy_absolute(path, backup)
+		if backup_error != OK:
+			return backup_error
+		if FileAccess.get_sha256(path) != FileAccess.get_sha256(backup):
+			return ERR_FILE_CORRUPT
+	var err := DirAccess.rename_absolute(tmp, path)
+	if err != OK and had_original and not FileAccess.file_exists(path):
+		DirAccess.copy_absolute(backup, path)
+	return err
+
+static func _save_config_recoverably(cfg: ConfigFile, path: String) -> Error:
+	var tmp := path + ".tmp"
+	var err := cfg.save(tmp)
+	if err != OK:
+		return err
+	var verify := ConfigFile.new()
+	if verify.load(tmp) != OK:
+		return ERR_FILE_CORRUPT
+	return _replace_file_recoverably(ProjectSettings.globalize_path(path), ProjectSettings.globalize_path(tmp))
+
+# Inspect ZIP central-directory sizes before ZIPReader allocates decompressed entries.
+# ZIP64/encrypted archives are explicitly unsupported by this bounded scanner.
+func _zip_scan_sizes(path: String) -> Dictionary:
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null or file.get_length() < 22:
+		return {}
+	var tail_size: int = mini(file.get_length(), 65557)
+	file.seek(file.get_length() - tail_size)
+	var tail := file.get_buffer(tail_size)
+	var end := -1
+	for i in range(tail.size() - 22, -1, -1):
+		if tail.decode_u32(i) == 0x06054b50 and i + 22 + tail.decode_u16(i + 20) == tail.size():
+			end = i
+			break
+	if end < 0 or tail.decode_u16(end + 4) != 0 or tail.decode_u16(end + 6) != 0:
+		return {}
+	var count := tail.decode_u16(end + 10)
+	var offset := tail.decode_u32(end + 16)
+	if count == 65535 or count > 10000 or offset >= file.get_length():
+		return {}
+	file.seek(offset)
+	var sizes := {}
+	var total := 0
+	for i in count:
+		var header := file.get_buffer(46)
+		if header.size() != 46 or header.decode_u32(0) != 0x02014b50 or header.decode_u16(8) & 1:
+			return {}
+		var size := header.decode_u32(24)
+		total += size
+		if size > 32 * 1024 * 1024 or total > 256 * 1024 * 1024:
+			return {}
+		var name := file.get_buffer(header.decode_u16(28)).get_string_from_utf8()
+		if sizes.has(name):
+			return {}
+		sizes[name] = size
+		file.seek(file.get_position() + header.decode_u16(30) + header.decode_u16(32))
+	return sizes
+
+func _archive_bytes(zr: ZIPReader, archive: String, name: String) -> PackedByteArray:
+	var key := str(_archive_fingerprints.get(archive, archive)) + "::" + name
+	if _archive_text.has(key):
+		return _archive_text[key]
+	var bytes := zr.read_file(name)
+	if bytes.size() <= 8 * 1024 * 1024 and _archive_text_bytes + bytes.size() <= 16 * 1024 * 1024:
+		_archive_text[key] = bytes
+		_archive_text_bytes += bytes.size()
+	return bytes
+
+func _save_snapshot_files(root_path: String, relative: String, paths: Array[String]) -> void:
+	var dir := DirAccess.open(root_path.path_join(relative))
+	if dir == null:
+		return
+	dir.list_dir_begin()
+	var name := dir.get_next()
+	while name != "":
+		var rel := relative.path_join(name)
+		if not name.begins_with(".") and not dir.is_link(name):
+			if dir.current_is_dir():
+				# SaveSystem uses numeric Steam IDs as subdirectories.
+				if relative.is_empty() and name.is_valid_int():
+					_save_snapshot_files(root_path, rel, paths)
+			elif name.ends_with(".save"):
+				paths.append(rel)
+		name = dir.get_next()
+
+func _snapshot_before_launch() -> bool:
+	if not _snapshot_enabled:
+		return true
+	var cfg := ConfigFile.new()
+	cfg.load(UI_CONFIG_PATH)
+	var signature := _configuration_signature()
+	if str(cfg.get_value("settings", "last_applied_loadout", "")) == signature:
+		return true
+	var paths: Array[String] = []
+	var user_path := ProjectSettings.globalize_path("user://")
+	_save_snapshot_files(user_path, "", paths)
+	var dest := user_path.path_join("orckit_save_snapshots").path_join("%d-%d" % [Time.get_unix_time_from_system(), Time.get_ticks_usec()])
+	var hashes := {}
+	for relative in paths:
+		var source := user_path.path_join(relative)
+		var target := dest.path_join(relative)
+		if DirAccess.make_dir_recursive_absolute(target.get_base_dir()) != OK:
+			return false
+		var before := FileAccess.get_sha256(source)
+		if before.is_empty() or DirAccess.copy_absolute(source, target) != OK or FileAccess.get_sha256(target) != before or FileAccess.get_sha256(source) != before:
+			return false
+		hashes[relative] = before
+	if not paths.is_empty():
+		var manifest := FileAccess.open(dest.path_join("manifest.json"), FileAccess.WRITE)
+		if manifest == null:
+			return false
+		manifest.store_string(JSON.stringify({"loadout": signature, "files": hashes}, "\t"))
+	return true

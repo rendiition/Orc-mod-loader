@@ -90,6 +90,12 @@ static func _mount_previous_session() -> Dictionary:
 		_static_reset_override_cfg(log_lines)
 		_write_filescope_log(log_lines)
 		return mounted
+	var saved_game_hash := str(cfg.get_value("state", "game_hash", ""))
+	var saved_loader_hash := str(cfg.get_value("state", "loader_hash", ""))
+	if saved_game_hash != FileAccess.get_sha256(OS.get_executable_path()) or saved_loader_hash != FileAccess.get_sha256(MODLOADER_RES_PATH):
+		_static_force_vanilla_state("game or loader content changed", log_lines)
+		_write_filescope_log(log_lines)
+		return mounted
 	var saved_exe_mtime: int = cfg.get_value("state", "exe_mtime", 0)
 	if saved_exe_mtime != 0:
 		var current_exe_mtime := FileAccess.get_modified_time(OS.get_executable_path())
@@ -109,10 +115,11 @@ static func _mount_previous_session() -> Dictionary:
 	log_lines.append("[FileScope] %d archive path(s) in pass state" % paths.size())
 
 	var any_missing := false
+	var archive_hashes: Dictionary = cfg.get_value("state", "archive_hashes", {})
 	for path in paths:
 		var abs_path := path if not path.begins_with("res://") and not path.begins_with("user://") \
 				else ProjectSettings.globalize_path(path)
-		if FileAccess.file_exists(abs_path):
+		if FileAccess.file_exists(abs_path) and archive_hashes.get(path, "") == FileAccess.get_sha256(abs_path):
 			log_lines.append("[FileScope]   EXISTS: " + abs_path)
 			continue
 		log_lines.append("[FileScope]   MISSING: " + abs_path)
@@ -371,12 +378,7 @@ func _ensure_early_autoload_on_disk(res_path: String, mod_name: String) -> Strin
 
 func _collect_enabled_archive_paths() -> PackedStringArray:
 	var paths := PackedStringArray()
-	var candidates: Array[Dictionary] = []
-	for entry in _ui_mod_entries:
-		if not entry["enabled"]:
-			continue
-		candidates.append(entry.duplicate())
-	candidates.sort_custom(_compare_load_order)
+	var candidates := _ordered_candidates(_ui_mod_entries)
 	for c in candidates:
 		if c["ext"] == "folder":
 			var folder_name: String = c["full_path"].get_file()
@@ -407,16 +409,7 @@ func _write_override_cfg(prepend_autoloads: Array[Dictionary]) -> Error:
 		return FileAccess.get_open_error()
 	f.store_string("\n".join(lines) + "\n" + preserved)
 	f.close()
-	if FileAccess.file_exists(path):
-		DirAccess.remove_absolute(path)
-	var dir := DirAccess.open(exe_dir)
-	if dir == null:
-		DirAccess.remove_absolute(tmp)
-		return ERR_CANT_OPEN
-	var err := dir.rename(tmp.get_file(), path.get_file())
-	if err != OK:
-		DirAccess.remove_absolute(tmp)
-	return err
+	return _replace_file_recoverably(path, tmp)
 
 func _persist_hook_pack_state(pack_path: String, wrapped_paths: PackedStringArray = PackedStringArray()) -> void:
 	var cfg := ConfigFile.new()
@@ -426,7 +419,7 @@ func _persist_hook_pack_state(pack_path: String, wrapped_paths: PackedStringArra
 	cfg.set_value("state", "hook_pack_exe_mtime", FileAccess.get_modified_time(OS.get_executable_path()))
 	if cfg.get_value("state", "modloader_version", "") == "":
 		cfg.set_value("state", "modloader_version", MODLOADER_VERSION)
-	if cfg.save(PASS_STATE_PATH) == OK:
+	if _save_config_recoverably(cfg, PASS_STATE_PATH) == OK:
 		_log_info("[OrcKitCodegen] Persisted hook pack path for next-session static-init mount: %s (%d wrapped path(s))" \
 				% [pack_path.get_file(), wrapped_paths.size()])
 
@@ -437,6 +430,12 @@ func _write_pass_state(archive_paths: PackedStringArray, state_hash: String = ""
 	cfg.set_value("state", "restart_count", count + 1)
 	cfg.set_value("state", "mods_hash", state_hash)
 	cfg.set_value("state", "archive_paths", archive_paths)
+	var archive_hashes := {}
+	for archive in archive_paths:
+		archive_hashes[archive] = FileAccess.get_sha256(archive)
+	cfg.set_value("state", "archive_hashes", archive_hashes)
+	cfg.set_value("state", "game_hash", FileAccess.get_sha256(OS.get_executable_path()))
+	cfg.set_value("state", "loader_hash", FileAccess.get_sha256(MODLOADER_RES_PATH))
 	cfg.set_value("state", "modloader_version", MODLOADER_VERSION)
 	cfg.set_value("state", "exe_mtime", FileAccess.get_modified_time(OS.get_executable_path()))
 	cfg.set_value("state", "timestamp", Time.get_unix_time_from_system())
@@ -444,7 +443,7 @@ func _write_pass_state(archive_paths: PackedStringArray, state_hash: String = ""
 	for entry in _pending_script_overrides:
 		override_data.append(entry.duplicate())
 	cfg.set_value("state", "script_overrides", override_data)
-	var err := cfg.save(PASS_STATE_PATH)
+	var err := _save_config_recoverably(cfg, PASS_STATE_PATH)
 	if err != OK:
 		_log_critical("Failed to save pass state (error %d)" % err)
 	return err
@@ -454,9 +453,8 @@ func _compute_state_hash(archive_paths: PackedStringArray, prepend_autoloads: Ar
 		return ""
 	var parts := PackedStringArray()
 	var sorted_paths := Array(archive_paths)
-	sorted_paths.sort()
 	for p in sorted_paths:
-		parts.append("a:%s@%d" % [p, FileAccess.get_modified_time(p)])
+		parts.append("a:%s@%s" % [p, FileAccess.get_sha256(p)])
 	for entry in prepend_autoloads:
 		parts.append("p:%s=%s" % [entry["name"], entry["path"]])
 	for entry in _ui_mod_entries:
@@ -470,7 +468,9 @@ func _compute_state_hash(archive_paths: PackedStringArray, prepend_autoloads: Ar
 	var self_mtime: int = FileAccess.get_modified_time(MODLOADER_RES_PATH)
 	if self_mtime > 0:
 		parts.append("ml_mtime:%d" % self_mtime)
-	return "\n".join(parts).md5_text()
+	parts.append("game:" + FileAccess.get_sha256(OS.get_executable_path()))
+	parts.append("loader:" + FileAccess.get_sha256(MODLOADER_RES_PATH))
+	return "\n".join(parts).sha256_text()
 
 func _write_heartbeat() -> void:
 	var f := FileAccess.open(HEARTBEAT_PATH, FileAccess.WRITE)
@@ -551,4 +551,4 @@ func _clear_restart_counter() -> void:
 	var cfg := ConfigFile.new()
 	if cfg.load(PASS_STATE_PATH) == OK:
 		cfg.set_value("state", "restart_count", 0)
-		cfg.save(PASS_STATE_PATH)
+		_save_config_recoverably(cfg, PASS_STATE_PATH)

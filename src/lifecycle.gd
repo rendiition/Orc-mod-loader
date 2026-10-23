@@ -1,5 +1,6 @@
 
 func _ready() -> void:
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	if _has_loaded:
 		return
 	_has_loaded = true
@@ -43,9 +44,8 @@ func _preserve_engine_driver_args(args: Array) -> void:
 func reopen_mod_ui() -> void:
 	if _ui_window != null:
 		return
-	_dirty_since_boot = false
-	await show_mod_ui()
-	if _dirty_since_boot:
+	var action := await show_mod_ui()
+	if action == "restart":
 		_log_info("[OrcKit] Post-boot mod changes detected -- restarting")
 		_modloader_restart(true)
 
@@ -57,7 +57,7 @@ func _run_pass_1() -> void:
 	_build_class_name_lookup()
 	_enumerate_game_scripts()
 	_load_developer_mode_setting()
-	_ui_mod_entries = collect_mod_metadata()
+	_ui_mod_entries = await _discover_with_progress()
 	_clean_stale_cache()
 	_load_ui_config()
 	await show_mod_ui()
@@ -201,7 +201,7 @@ func _run_pass_2() -> void:
 	_build_class_name_lookup()
 	_enumerate_game_scripts()
 	_load_developer_mode_setting()
-	_ui_mod_entries = collect_mod_metadata()
+	_ui_mod_entries = await _discover_with_progress()
 	_load_ui_config()
 
 	load_all_mods("Pass 2")

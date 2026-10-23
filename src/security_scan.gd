@@ -151,6 +151,21 @@ func _security_compile_rules() -> void:
 			_log_warning("[SecurityScan] Failed to compile rule pattern: " + str(rule["id"]))
 
 func scan_mod(full_path: String, ext: String) -> Array:
+	var started := Time.get_ticks_usec()
+	var cache_key := ""
+	if ext != "folder":
+		var fingerprint := FileAccess.get_sha256(full_path)
+		_archive_fingerprints[full_path] = fingerprint
+		cache_key = fingerprint + "-" + MODLOADER_VERSION
+		cache_key += "-" + FileAccess.get_sha256(MODLOADER_RES_PATH)
+		if _scan_cache.has(cache_key):
+			return _scan_cache[cache_key].duplicate(true)
+		var cache_path := "user://orckit_analysis/" + cache_key + ".json"
+		if FileAccess.file_exists(cache_path):
+			var cached: Variant = JSON.parse_string(FileAccess.get_file_as_string(cache_path))
+			if cached is Array and _valid_cached_findings(cached):
+				_scan_cache[cache_key] = cached
+				return cached.duplicate(true)
 	_security_compile_rules()
 	var findings: Array = []
 	match ext:
@@ -161,6 +176,13 @@ func scan_mod(full_path: String, ext: String) -> Array:
 		"folder":
 			_security_scan_folder(full_path, "", findings)
 	findings.sort_custom(_security_sort_findings)
+	if not cache_key.is_empty():
+		_scan_cache[cache_key] = findings.duplicate(true)
+		DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("user://orckit_analysis"))
+		var cache_file := FileAccess.open("user://orckit_analysis/" + cache_key + ".json", FileAccess.WRITE)
+		if cache_file:
+			cache_file.store_string(JSON.stringify(findings))
+	_record_timing("scan", started)
 	return findings
 
 func _security_sort_findings(a: Dictionary, b: Dictionary) -> bool:
@@ -171,6 +193,10 @@ func _security_sort_findings(a: Dictionary, b: Dictionary) -> bool:
 	return int(a.get("line", 0)) < int(b.get("line", 0))
 
 func _security_scan_zip(zip_path: String, findings: Array) -> void:
+	var sizes := _zip_scan_sizes(zip_path)
+	if sizes.is_empty():
+		_scan_incomplete(findings, zip_path, "Archive exceeds scan limits, is unsupported, or is invalid")
+		return
 	var zr := ZIPReader.new()
 	if zr.open(zip_path) != OK:
 		return
@@ -181,13 +207,17 @@ func _security_scan_zip(zip_path: String, findings: Array) -> void:
 			continue
 		var ext := f.get_extension().to_lower()
 		if _TEXT_SCAN_EXTS.has(ext):
-			var bytes := zr.read_file(f)
+			if int(sizes.get(f, 0)) > _MAX_TEXT_SCAN_BYTES:
+				_scan_incomplete(findings, f, "Text exceeds scan limit")
+				continue
+			var bytes := _archive_bytes(zr, zip_path, f)
 			if bytes.size() > _MAX_TEXT_SCAN_BYTES:
+				_scan_incomplete(findings, "large text file", "Text exceeds scan limit")
 				continue
 			_security_scan_text(f, bytes.get_string_from_utf8(), findings)
 			continue
 		if _BINARY_SCAN_EXTS.has(ext) or ext == "gdc":
-			_security_scan_binary(f, zr.read_file(f), findings)
+			_security_scan_binary(f, _archive_bytes(zr, zip_path, f), findings)
 	zr.close()
 
 func _security_scan_folder(root: String, rel: String, findings: Array) -> void:
@@ -209,9 +239,14 @@ func _security_scan_folder(root: String, rel: String, findings: Array) -> void:
 			continue
 		var ext := entry.get_extension().to_lower()
 		var disk_path := root.path_join(rel_path)
+		var source_file := FileAccess.open(disk_path, FileAccess.READ)
+		if source_file == null or source_file.get_length() > _MAX_TEXT_SCAN_BYTES:
+			_scan_incomplete(findings, rel_path, "Unreadable file or scan size limit exceeded")
+			continue
 		if _TEXT_SCAN_EXTS.has(ext):
 			var bytes := FileAccess.get_file_as_bytes(disk_path)
 			if bytes.size() > _MAX_TEXT_SCAN_BYTES:
+				_scan_incomplete(findings, "large text file", "Text exceeds scan limit")
 				continue
 			_security_scan_text(rel_path, bytes.get_string_from_utf8(), findings)
 			continue
@@ -223,6 +258,7 @@ func _security_scan_folder(root: String, rel: String, findings: Array) -> void:
 func _security_scan_pck(pck_path: String, findings: Array) -> void:
 	var entries := _security_pck_list_with_offsets(pck_path)
 	if entries.is_empty():
+		_scan_incomplete(findings, pck_path, "No readable PCK entries")
 		return
 	var f := FileAccess.open(pck_path, FileAccess.READ)
 	if f == null:
@@ -234,10 +270,14 @@ func _security_scan_pck(pck_path: String, findings: Array) -> void:
 		var ext := path.get_extension().to_lower()
 		if not (_TEXT_SCAN_EXTS.has(ext) or _BINARY_SCAN_EXTS.has(ext) or ext == "gdc"):
 			continue
+		if int(entry["size"]) > _MAX_TEXT_SCAN_BYTES or int(entry["offset"]) < 0 or int(entry["offset"]) + int(entry["size"]) > f.get_length():
+			_scan_incomplete(findings, path, "Invalid extent or scan size limit exceeded")
+			continue
 		f.seek(int(entry["offset"]))
 		var bytes := f.get_buffer(int(entry["size"]))
 		if _TEXT_SCAN_EXTS.has(ext):
 			if bytes.size() > _MAX_TEXT_SCAN_BYTES:
+				_scan_incomplete(findings, "large text file", "Text exceeds scan limit")
 				continue
 			_security_scan_text(path, bytes.get_string_from_utf8(), findings)
 		else:
@@ -345,7 +385,7 @@ func _security_pck_list_with_offsets(pck_path: String) -> Array:
 		return result
 	f.get_32(); f.get_32(); f.get_32()
 	var pack_flags: int = f.get_32()
-	f.get_64()
+	var file_base := f.get_64()
 	if version == PACK_FORMAT_V3:
 		f.seek(f.get_64())
 	else:
@@ -355,12 +395,22 @@ func _security_pck_list_with_offsets(pck_path: String) -> Array:
 		f.close()
 		return result
 	var file_count: int = f.get_32()
+	if file_count > 100000:
+		return []
 	for i in file_count:
 		var path_len: int = f.get_32()
 		if path_len == 0 or path_len > 4096:
 			break
-		var path := f.get_buffer(path_len).get_string_from_utf8()
+		if f.get_position() + path_len + 36 > f.get_length():
+			return []
+		var path_bytes := f.get_buffer(path_len)
+		var terminator := path_bytes.find(0)
+		if terminator >= 0:
+			path_bytes.resize(terminator)
+		var path := path_bytes.get_string_from_utf8()
 		var offset: int = f.get_64()
+		if pack_flags & 2:
+			offset += file_base
 		var size: int = f.get_64()
 		f.get_buffer(16)
 		f.get_32()
@@ -368,3 +418,11 @@ func _security_pck_list_with_offsets(pck_path: String) -> Array:
 			result.append({"path": path, "offset": offset, "size": size})
 	f.close()
 	return result
+func _scan_incomplete(findings: Array, file: String, reason: String) -> void:
+	findings.append({"file": file, "line": 0, "rule": "incomplete_scan", "description": reason})
+
+func _valid_cached_findings(findings: Array) -> bool:
+	for finding in findings:
+		if not finding is Dictionary or not finding.get("file") is String or not finding.get("rule") is String or not finding.get("description") is String:
+			return false
+	return true

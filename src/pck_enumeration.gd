@@ -174,7 +174,7 @@ func _enumerate_game_scripts() -> Array[String]:
 	if not _all_game_script_paths.is_empty():
 		return _all_game_script_paths
 	var exe_dir := OS.get_executable_path().get_base_dir()
-	var candidates := [OS.get_executable_path().get_file().get_basename() + ".pck"]
+	var candidates := [OS.get_executable_path().get_file().get_basename() + ".pck", OS.get_executable_path().get_file()]
 	for cand in candidates:
 		var pck_path := exe_dir.path_join(cand)
 		if not FileAccess.file_exists(pck_path):
@@ -200,8 +200,10 @@ func _enumerate_game_scripts() -> Array[String]:
 				scripts.append(canonical)
 		_log_info("[OrcKitCodegen] parsed %s -- %d total file(s), %d game script(s)" \
 				% [cand, paths.size(), scripts.size()])
+		_script_discovery_source = cand
 		_all_game_script_paths = scripts
 		return scripts
+	_script_discovery_source = "Compatibility fallback: playtest manifest (unverified build)"
 	_all_game_script_paths = GAME_SCRIPT_PATHS.duplicate()
 	_log_info("[OrcKitCodegen] using embedded playtest script manifest (%d game script paths)" \
 			% _all_game_script_paths.size())
@@ -239,11 +241,19 @@ func _parse_pck_file_list(pck_path: String) -> PackedStringArray:
 		_log_warning("[PCK] cannot open: %s" % pck_path)
 		return result
 
+	var pack_start := 0
 	var magic: int = f.get_32()
 	if magic != MAGIC_GDPC:
-		_log_warning("[PCK] %s: not a standalone PCK (magic=0x%x)" % [pck_path, magic])
-		f.close()
-		return result
+		if f.get_length() < 12:
+			return result
+		f.seek(f.get_length() - 12)
+		var pack_size := f.get_64()
+		if f.get_32() != MAGIC_GDPC or pack_size > f.get_length() - 12:
+			return result
+		pack_start = f.get_length() - 12 - pack_size
+		f.seek(pack_start)
+		if f.get_32() != MAGIC_GDPC:
+			return result
 
 	var pack_format_version: int = f.get_32()
 	if pack_format_version < PACK_FORMAT_V2 or pack_format_version > PACK_FORMAT_V3:
@@ -258,7 +268,7 @@ func _parse_pck_file_list(pck_path: String) -> PackedStringArray:
 	f.get_64()
 
 	if pack_format_version == PACK_FORMAT_V3:
-		f.seek(f.get_64())
+		f.seek(pack_start + f.get_64())
 	else:
 		for i in 16:
 			f.get_32()
@@ -269,13 +279,21 @@ func _parse_pck_file_list(pck_path: String) -> PackedStringArray:
 		return result
 
 	var file_count: int = f.get_32()
+	if file_count > 100000:
+		return result
 	for i in file_count:
 		var path_len: int = f.get_32()
 		if path_len == 0 or path_len > 4096:
 			_log_warning("[PCK] %s: suspicious path_len=%d at entry %d -- abort" \
 					% [pck_path, path_len, i])
 			break
-		var path := f.get_buffer(path_len).get_string_from_utf8()
+		if f.get_position() + path_len + 36 > f.get_length():
+			return PackedStringArray()
+		var path_bytes := f.get_buffer(path_len)
+		var terminator := path_bytes.find(0)
+		if terminator >= 0:
+			path_bytes.resize(terminator)
+		var path := path_bytes.get_string_from_utf8()
 		f.get_64()
 		var size: int = f.get_64()
 		f.get_buffer(16)

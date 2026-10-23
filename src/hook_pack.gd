@@ -347,6 +347,7 @@ func _activate_rewritten_scripts(script_paths: Array[String], pack_path: String)
 		_log_info("[OrcKitCodegen] DEFER %d script(s) with module-scope scene preload -- will lazy-compile via VFS after mod overrides: %s" \
 				% [deferred.size(), ", ".join(Array(deferred))])
 
+	var inspections := {}
 	var pre_a := 0
 	var pre_b := 0
 	var pre_c := 0
@@ -361,6 +362,7 @@ func _activate_rewritten_scripts(script_paths: Array[String], pack_path: String)
 			pre_d += 1
 			continue
 		var pre_rename := _script_has_rewritten_methods(c)
+		inspections[vp] = {"script": c, "rewritten": pre_rename}
 		var srclen: int = c.source_code.length()
 		if pre_rename:
 			pre_a += 1
@@ -384,12 +386,12 @@ func _activate_rewritten_scripts(script_paths: Array[String], pack_path: String)
 	for vp: String in script_paths:
 		if _scripts_with_scene_preloads.has(vp):
 			continue
-		var cached := load(vp) as GDScript
+		var cached: GDScript = inspections.get(vp, {}).get("script")
 		if cached == null:
 			_log_warning("[OrcKitCodegen] activate %s: load returned null -- skip" % vp)
 			continue
 
-		var already_live := _script_has_rewritten_methods(cached)
+		var already_live: bool = inspections[vp]["rewritten"]
 		if already_live:
 			var fresh_source := FileAccess.get_file_as_string(vp)
 			if not fresh_source.is_empty() and fresh_source != cached.source_code:
