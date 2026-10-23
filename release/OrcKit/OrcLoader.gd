@@ -131,6 +131,8 @@ var _archive_fingerprints: Dictionary = {}
 var _scan_progress: Label
 var _ui_back_button: Button
 
+var _automatic_startup := true
+
 
 func _log_info(msg: String) -> void:
 	var line := "[OrcKit][Info] " + msg
@@ -627,6 +629,10 @@ static func _mount_previous_session() -> Dictionary:
 		_write_filescope_log(log_lines)
 		return mounted
 
+	if FileAccess.file_exists(OS.get_executable_path().get_base_dir().path_join(SAFE_MODE_FILE)):
+		_static_force_vanilla_state("safe mode requested", log_lines)
+		_write_filescope_log(log_lines)
+		return mounted
 	if FileAccess.file_exists(PASS2_DIRTY_PATH):
 		_static_force_vanilla_state("pass 2 crashed mid-run", log_lines)
 		_write_filescope_log(log_lines)
@@ -674,6 +680,13 @@ static func _mount_previous_session() -> Dictionary:
 			_write_filescope_log(log_lines)
 			return mounted
 	var paths: PackedStringArray = cfg.get_value("state", "archive_paths", PackedStringArray())
+	var saved_hook_path := str(cfg.get_value("state", "hook_pack_path", ""))
+	var saved_hook_hash := str(cfg.get_value("state", "hook_pack_hash", ""))
+	if not saved_hook_path.is_empty() and not saved_hook_hash.is_empty():
+		if not FileAccess.file_exists(saved_hook_path) or FileAccess.get_sha256(saved_hook_path) != saved_hook_hash:
+			_static_force_vanilla_state("cached hook pack changed or missing", log_lines)
+			_write_filescope_log(log_lines)
+			return mounted
 	if paths.is_empty():
 		log_lines.append("[FileScope] Pass state has no archive paths -- skipping")
 		_write_filescope_log(log_lines)
@@ -783,6 +796,7 @@ static func _mount_previous_session() -> Dictionary:
 							% [preloaded, preload_failed, skipped_lenient])
 			else:
 				log_lines.append("[FileScope] HOOK PACK mount FAILED: " + hook_pack)
+				mounted.clear() # Do not permit automatic startup after a failed mount.
 		else:
 			log_lines.append("[FileScope] HOOK PACK path in pass_state but file missing: " + hook_abs)
 
@@ -982,6 +996,7 @@ func _persist_hook_pack_state(pack_path: String, wrapped_paths: PackedStringArra
 	var cfg := ConfigFile.new()
 	cfg.load(PASS_STATE_PATH)
 	cfg.set_value("state", "hook_pack_path", pack_path)
+	cfg.set_value("state", "hook_pack_hash", FileAccess.get_sha256(pack_path))
 	cfg.set_value("state", "hook_pack_wrapped_paths", wrapped_paths)
 	cfg.set_value("state", "hook_pack_exe_mtime", FileAccess.get_modified_time(OS.get_executable_path()))
 	if cfg.get_value("state", "modloader_version", "") == "":
@@ -996,6 +1011,8 @@ func _write_pass_state(archive_paths: PackedStringArray, state_hash: String = ""
 	var count: int = cfg.get_value("state", "restart_count", 0)
 	cfg.set_value("state", "restart_count", count + 1)
 	cfg.set_value("state", "mods_hash", state_hash)
+	cfg.set_value("state", "startup_ready", false)
+	cfg.set_value("state", "loadout_signature", _configuration_signature())
 	cfg.set_value("state", "archive_paths", archive_paths)
 	var archive_hashes := {}
 	for archive in archive_paths:
@@ -2577,6 +2594,7 @@ func _load_developer_mode_setting() -> void:
 	_developer_mode = bool(cfg.get_value("settings", "developer_mode", false))
 	_snapshot_enabled = bool(cfg.get_value("settings", "save_snapshots", false))
 	_diagnostics_enabled = bool(cfg.get_value("settings", "diagnostics", false))
+	_automatic_startup = bool(cfg.get_value("settings", "automatic_startup", true))
 	if _developer_mode:
 		_log_info("Developer mode: ON")
 
@@ -2740,6 +2758,7 @@ func _save_ui_config() -> void:
 	cfg.set_value("settings", "active_profile", _active_profile)
 	cfg.set_value("settings", "save_snapshots", _snapshot_enabled)
 	cfg.set_value("settings", "diagnostics", _diagnostics_enabled)
+	cfg.set_value("settings", "automatic_startup", _automatic_startup)
 	_save_preferences(cfg)
 	refresh_launch_button_label()
 
@@ -4008,6 +4027,11 @@ func _build_settings_tab() -> Control:
 	info.text = "Game: %s\nEngine: %s\nExecutable: %s\nMods: %s\nScript discovery: %s" % [ProjectSettings.get_setting("application/config/version", "unknown"), Engine.get_version_info()["string"], OS.get_executable_path(), _mods_dir, _script_discovery_source]
 	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	box.add_child(info)
+	var auto_start := CheckBox.new()
+	auto_start.text = "Load saved mods automatically on startup"
+	auto_start.button_pressed = _automatic_startup
+	auto_start.toggled.connect(func(on: bool): _automatic_startup = on; _save_ui_config())
+	box.add_child(auto_start)
 	var snapshot := CheckBox.new()
 	snapshot.text = "Back up saves before launching a changed mod loadout"
 	snapshot.button_pressed = _snapshot_enabled
@@ -6818,6 +6842,7 @@ func reopen_mod_ui() -> void:
 
 func _run_pass_1() -> void:
 	_log_info("OrcKit v" + MODLOADER_VERSION)
+	var interrupted_startup := FileAccess.file_exists(HEARTBEAT_PATH)
 	_check_crash_recovery()
 	_check_safe_mode()
 	_compile_regex()
@@ -6827,6 +6852,10 @@ func _run_pass_1() -> void:
 	_ui_mod_entries = await _discover_with_progress()
 	_clean_stale_cache()
 	_load_ui_config()
+	if not interrupted_startup and _can_resume_saved_loadout():
+		_log_info("Saved loadout verified -- loading enabled mods without a startup menu or restart")
+		await _run_pass_2(true)
+		return
 	await show_mod_ui()
 	_save_ui_config()
 
@@ -6888,8 +6917,6 @@ func _filescope_mounts_differ_from(archive_paths: PackedStringArray) -> bool:
 	var desired: Array[String] = []
 	for p in archive_paths:
 		desired.append(String(p))
-	mounted.sort()
-	desired.sort()
 	if mounted.size() != desired.size():
 		return true
 	for i in mounted.size():
@@ -6926,6 +6953,7 @@ func _finish_with_existing_mounts() -> void:
 		if err != OK:
 			_log_critical("reload_current_scene() failed with error " + str(err))
 			return
+	_mark_startup_ready()
 
 func _finish_single_pass() -> void:
 	_boot_complete = true
@@ -6947,7 +6975,7 @@ func _finish_single_pass() -> void:
 
 
 
-func _run_pass_2() -> void:
+func _run_pass_2(discovery_ready: bool = false) -> void:
 	_boot_complete = true
 	_log_info("Pass 2 -- %d archive(s) mounted at file-scope" % _filescope_mounted.size())
 	var _dirty_f := FileAccess.open(PASS2_DIRTY_PATH, FileAccess.WRITE)
@@ -6964,12 +6992,13 @@ func _run_pass_2() -> void:
 				_log_warning("[Overrides] Malformed entry in pass state -- skipped")
 	_apply_script_overrides()
 	_clear_restart_counter()
-	_compile_regex()
-	_build_class_name_lookup()
-	_enumerate_game_scripts()
-	_load_developer_mode_setting()
-	_ui_mod_entries = await _discover_with_progress()
-	_load_ui_config()
+	if not discovery_ready:
+		_compile_regex()
+		_build_class_name_lookup()
+		_enumerate_game_scripts()
+		_load_developer_mode_setting()
+		_ui_mod_entries = await _discover_with_progress()
+		_load_ui_config()
 
 	load_all_mods("Pass 2")
 	_register_orcmodlib_meta()
@@ -6986,13 +7015,61 @@ func _run_pass_2() -> void:
 		_write_conflict_report()
 	_emit_frameworks_ready()
 	_delete_heartbeat()
-	if FileAccess.file_exists(PASS2_DIRTY_PATH):
-		DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS2_DIRTY_PATH))
 	if not _filescope_mounted.is_empty() or not _archive_file_sets.is_empty() or _pending_autoloads.size() > 0:
 		var err := get_tree().reload_current_scene()
 		if err != OK:
 			_log_critical("reload_current_scene() failed with error " + str(err))
 			return
+	_mark_startup_ready()
+	if FileAccess.file_exists(PASS2_DIRTY_PATH):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(PASS2_DIRTY_PATH))
+
+# Only unchanged, successfully prepared archives can bypass startup UI.
+# Folder mods remain in the setup path because their contents may change live.
+func _can_resume_saved_loadout() -> bool:
+	if not _automatic_startup or "--modloader-menu" in OS.get_cmdline_user_args():
+		return false
+	if FileAccess.file_exists(PASS2_DIRTY_PATH) or FileAccess.file_exists(HEARTBEAT_PATH):
+		return false
+	var cfg := ConfigFile.new()
+	if cfg.load(PASS_STATE_PATH) != OK or not bool(cfg.get_value("state", "startup_ready", false)):
+		return false
+	if str(cfg.get_value("state", "loadout_signature", "")) != _configuration_signature():
+		return false
+	if str(cfg.get_value("state", "game_hash", "")) != FileAccess.get_sha256(OS.get_executable_path()) or str(cfg.get_value("state", "loader_hash", "")) != FileAccess.get_sha256(MODLOADER_RES_PATH):
+		return false
+	var candidates := _ordered_candidates(_ui_mod_entries)
+	var desired := PackedStringArray()
+	var hashes: Dictionary = cfg.get_value("state", "archive_hashes", {})
+	for entry in _ui_mod_entries:
+		if entry.get("enabled", false) and entry.get("dependency_blocked", false):
+			return false
+	for entry in candidates:
+		if entry["ext"] == "folder":
+			return false
+		var path := str(entry["full_path"])
+		if not FileAccess.file_exists(path) or hashes.get(path, "") != FileAccess.get_sha256(path):
+			return false
+		desired.append(path)
+	var saved: PackedStringArray = cfg.get_value("state", "archive_paths", PackedStringArray())
+	if desired.is_empty() or saved != desired or _filescope_mounted.size() != desired.size() or _filescope_mounts_differ_from(desired):
+		return false
+	var hook_path := str(cfg.get_value("state", "hook_pack_path", ""))
+	if not hook_path.is_empty():
+		if not FileAccess.file_exists(hook_path) or str(cfg.get_value("state", "hook_pack_hash", "")) != FileAccess.get_sha256(hook_path):
+			return false
+	return true
+
+func _mark_startup_ready() -> void:
+	var cfg := ConfigFile.new()
+	if cfg.load(PASS_STATE_PATH) != OK:
+		return
+	cfg.set_value("state", "startup_ready", true)
+	cfg.set_value("state", "loadout_signature", _configuration_signature())
+	var hook_path := str(cfg.get_value("state", "hook_pack_path", ""))
+	cfg.set_value("state", "hook_pack_hash", FileAccess.get_sha256(hook_path) if not hook_path.is_empty() else "")
+	if _save_config_recoverably(cfg, PASS_STATE_PATH) != OK:
+		_log_warning("Could not record successful startup; next launch will use the setup menu")
 
 
 const _MENU_SCRIPT_PATH := "res://menu/menu.gd"

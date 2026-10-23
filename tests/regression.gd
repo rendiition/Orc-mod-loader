@@ -145,6 +145,47 @@ func run():
 	loader._request_ui_launch()
 	await process_frame
 	check(loader._ui_window == null, "unchanged Back to Game does not request security confirmation")
+	var automatic := entry("automatic")
+	automatic.full_path = "res://valid.vmz"
+	var automatic_entries: Array[Dictionary] = [automatic]
+	loader._ui_mod_entries = automatic_entries
+	loader._filescope_mounted = {"res://valid.vmz": true}
+	var paths := PackedStringArray(["res://valid.vmz"])
+	check(loader._write_pass_state(paths, "test") == OK, "startup receipt can be prepared")
+	check(not loader._can_resume_saved_loadout(), "uncompleted setup cannot autostart")
+	loader._mark_startup_ready()
+	check(loader._can_resume_saved_loadout(), "unchanged successful loadout autostarts")
+	loader._automatic_startup = false
+	check(not loader._can_resume_saved_loadout(), "automatic startup preference respected")
+	loader._automatic_startup = true
+	automatic.enabled = false
+	check(not loader._can_resume_saved_loadout(), "changed enabled selection requires setup")
+	automatic.enabled = true
+	automatic.ext = "folder"
+	check(not loader._can_resume_saved_loadout(), "editable folder mods require setup")
+	automatic.ext = "pck"
+	loader._filescope_mounted.clear()
+	check(not loader._can_resume_saved_loadout(), "missing early mount requires setup")
+	loader._filescope_mounted = {"res://valid.vmz": true}
+	var dirty := FileAccess.open(loader.PASS2_DIRTY_PATH, FileAccess.WRITE)
+	dirty.store_string("interrupted")
+	dirty.close()
+	check(not loader._can_resume_saved_loadout(), "interrupted boot cannot autostart")
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(loader.PASS2_DIRTY_PATH))
+	var receipt := ConfigFile.new()
+	receipt.load(loader.PASS_STATE_PATH)
+	receipt.set_value("state", "archive_hashes", {"res://valid.vmz": "changed"})
+	receipt.save(loader.PASS_STATE_PATH)
+	check(not loader._can_resume_saved_loadout(), "changed package fingerprint requires setup")
+	loader._write_pass_state(paths, "test")
+	loader._mark_startup_ready()
+	receipt.load(loader.PASS_STATE_PATH)
+	receipt.set_value("state", "hook_pack_path", "user://missing-hooks.zip")
+	receipt.set_value("state", "hook_pack_hash", "missing")
+	receipt.save(loader.PASS_STATE_PATH)
+	check(not loader._can_resume_saved_loadout(), "missing hook cache requires setup")
+	loader._filescope_mounted = {"first": true, "second": true}
+	check(loader._filescope_mounts_differ_from(PackedStringArray(["second", "first"])), "mount order changes require restart")
 	loader.queue_free()
 	await process_frame
 	print(JSON.stringify({"checks": checks, "failures": failures}))

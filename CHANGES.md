@@ -1,5 +1,13 @@
 # OrcKit 1.2.0 — loadout workflow and reliability
 
+## Automatic startup
+
+After a loadout successfully completes setup, later launches automatically load its unchanged enabled archives without opening the startup manager or restarting the process. Existing file-scope mounting runs before game autoloads; the runtime validates the saved selection, dependency order, package hashes, executable/loader hashes, mounted archives, and cached hook pack before continuing. A successful-start receipt is written after the scene reload succeeds. The existing mod initialization path is reused.
+
+First-time setup, changed loadouts or packages, game/loader updates, editable folder mods, and invalid or incomplete startup caches retain the setup flow. They may require a preparation restart. Safe mode is now checked before cached mods mount. Hook-pack hashes are checked before mounting, and mount order is compared in order rather than as an unordered set.
+
+**Load saved mods automatically on startup** defaults to enabled in Settings. Disable it to keep the startup manager. The user argument `--modloader-menu` forces the manager for one launch; pass it after `--`. In-game access remains available through **Mods**.
+
 The in-game Mods window now closes with its X, Escape, or Back to Game. If the selected loadout differs from the running one, closing offers Restart now, Save for next launch, or Keep editing. Saved changes remain pending across reopening. Reverting changes clears the warning; display preferences do not require a restart. The initial startup window still requires a launch choice.
 
 Changes remain saved immediately, as in 1.1.0. Save for next launch does not unload or replace running mods. The loader does not change the game's pause state. Restart now passes through the existing suspicious-code confirmation.
